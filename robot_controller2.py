@@ -34,7 +34,7 @@ class RobotController:
         # P-control
         # -----------------------------
 
-        self.Kp = 0.5
+        self.Kp = 0.8
 
         # -----------------------------
         # Smoothing for the detected
@@ -44,7 +44,7 @@ class RobotController:
         # -----------------------------
 
         self.cx_filtered = None
-        self.smoothing = 0.4  # higher = less smoothing
+        self.smoothing = 0.7  # higher = less smoothing
 
         # -----------------------------
         # Driving speed
@@ -93,11 +93,16 @@ class RobotController:
             
             if left_line is not None and right_line is not None:
 
-                # We want the road center close to the
-                # bottom of the image because this is
-                # where the car is about to travel.
+                # Look further ahead (closer to the top of
+                # the ROI) rather than right at the car.
+                # A near-field target makes the error
+                # collapse as soon as the car starts
+                # turning its nose into a curve, even
+                # though the turn isn't finished yet -
+                # causing the correction to snap back too
+                # early on sharp curves like the U-turn.
 
-                y_target = int(h * 0.85)
+                y_target = int(h * 0.65)
 
                 left_x = self.x_at_y(left_line, y_target)
                 right_x = self.x_at_y(right_line, y_target)
