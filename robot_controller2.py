@@ -31,18 +31,10 @@ class RobotController:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         # -----------------------------
-        # PID
-        # Start with P only.
-        # Add D later after basic
-        # navigation works.
+        # P-control
         # -----------------------------
 
         self.Kp = 0.5
-        self.Ki = 0.0
-        self.Kd = 0.0
-
-        self.integral = 0
-        self.last_error = 0
 
         # -----------------------------
         # Driving speed
@@ -130,7 +122,7 @@ class RobotController:
 
 
             # ==========================================
-            # 4. PID / navigation
+            # 4. P-control / navigation
             # ==========================================
 
             camera_center = w // 2
@@ -151,37 +143,19 @@ class RobotController:
                 # Error
                 # --------------------------------------
 
-                error = camera_center - cx 
+                error = camera_center - cx
 
                 # --------------------------------------
-                # Integral
+                # P-control
                 # --------------------------------------
 
-                self.integral += error
-
-                # --------------------------------------
-                # Derivative
-                # --------------------------------------
-
-                derivative = error - self.last_error
-
-                # --------------------------------------
-                # PID
-                # --------------------------------------
-
-                correction = int(
-                    self.Kp * error
-                    + self.Ki * self.integral
-                    + self.Kd * derivative
-                )
+                correction = int(self.Kp * error)
 
                 # Limit steering correction
                 correction = max(
                     min(correction, 100),
                     -100
                 )
-
-                self.last_error = error
 
                 # --------------------------------------
                 # Send command to EV3
@@ -260,10 +234,6 @@ class RobotController:
                     b"0,0",
                     (EV3_IP, EV3_PORT)
                 )
-
-                # Reset PID state
-                self.integral = 0
-                self.last_error = 0
 
 
             # ==========================================
@@ -559,9 +529,6 @@ class RobotController:
             self.cap = None
 
         cv2.destroyAllWindows()
-
-        self.integral = 0
-        self.last_error = 0
 
 
     # ==================================================

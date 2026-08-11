@@ -3,7 +3,7 @@ import cv2
 import threading
 import subprocess
 
-from robot_controller import RobotController
+from robot_controller2 import RobotController
 
 app = Flask(__name__)
 
