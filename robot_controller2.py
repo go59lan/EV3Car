@@ -46,6 +46,13 @@ class RobotController:
         self.cx_filtered = None
         self.smoothing = 0.5  # higher = less smoothing
 
+        # Last known x position of the lane centerline,
+        # used to keep the white dashed-line detector
+        # locked onto our lane instead of a dashed line
+        # belonging to a different part of the road.
+
+        self.center_line_x = None
+
         # -----------------------------
         # Driving speed
         # -----------------------------
@@ -90,26 +97,42 @@ class RobotController:
             # 3. Calculate road center
             # ==========================================
 
-            
+            # Look further ahead (closer to the top of the
+            # ROI) rather than right at the car. A
+            # near-field target makes the error collapse
+            # as soon as the car starts turning its nose
+            # into a curve, even though the turn isn't
+            # finished yet - causing the correction to
+            # snap back too early on sharp curves like the
+            # U-turn.
+
+            y_target = int(h * 0.65)
+
+            # Prefer the dashed white centerline when it's
+            # visible. It only ever marks our own lane, so
+            # unlike the yellow edges it can't be confused
+            # with a yellow border belonging to a different
+            # part of the road (e.g. a segment that comes
+            # back into view right after the U-turn).
+
+            center_line = self.detect_center_line(frame)
+            white_x = self.x_at_y(center_line, y_target)
+
             if left_line is not None and right_line is not None:
-
-                # Look further ahead (closer to the top of
-                # the ROI) rather than right at the car.
-                # A near-field target makes the error
-                # collapse as soon as the car starts
-                # turning its nose into a curve, even
-                # though the turn isn't finished yet -
-                # causing the correction to snap back too
-                # early on sharp curves like the U-turn.
-
-                y_target = int(h * 0.65)
 
                 left_x = self.x_at_y(left_line, y_target)
                 right_x = self.x_at_y(right_line, y_target)
 
-                if left_x is not None and right_x is not None:
-
+                if white_x is not None:
+                    cx = white_x
+                elif left_x is not None and right_x is not None:
                     cx = int((left_x + right_x) / 2)
+                else:
+                    cx = None
+
+                if cx is not None:
+
+                    self.center_line_x = cx
 
                     # Smooth cx to damp frame-to-frame
                     # jitter before it reaches the
@@ -148,6 +171,16 @@ class RobotController:
                         y_target,
                         (0, 255, 0)
                     )
+
+                    # Draw the detected centerline, when
+                    # found, in magenta for debugging.
+                    if center_line is not None:
+                        self.draw_line(
+                            frame,
+                            center_line,
+                            y_target,
+                            (255, 0, 255)
+                        )
 
 
             # ==========================================
@@ -239,6 +272,16 @@ class RobotController:
                     2
                 )
 
+                cv2.putText(
+                    frame,
+                    f"Source: {'white line' if white_x is not None else 'yellow edges'}",
+                    (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2
+                )
+
             else:
 
                 # ======================================
@@ -268,6 +311,7 @@ class RobotController:
                 # estimate so it doesn't bias the first
                 # reading once the road is found again.
                 self.cx_filtered = None
+                self.center_line_x = None
                 cx = None
 
 
@@ -349,27 +393,7 @@ class RobotController:
         #   |_/__________\_|
         # ----------------------------------------------
 
-        mask = np.zeros_like(yellow_mask)
-
-        polygon = np.array([
-            [
-                (0, h),
-                (w, h),
-                (int(w), int(h * 0.55)),
-                (int(0), int(h * 0.55))
-            ]
-        ], dtype=np.int32)
-
-        cv2.fillPoly(
-            mask,
-            polygon,
-            255
-        )
-
-        roi = cv2.bitwise_and(
-            yellow_mask,
-            mask
-        )
+        roi = self.apply_roi(yellow_mask, h, w)
 
         # ----------------------------------------------
         # Hough line detection
@@ -489,6 +513,136 @@ class RobotController:
         ]
 
         return self.average_line(outer_lines)
+
+
+    # ==================================================
+    # Mask a binary image down to the road ROI
+    # (lower part of the frame).
+    # ==================================================
+
+    def apply_roi(self, mask, h, w):
+
+        roi_mask = np.zeros_like(mask)
+
+        polygon = np.array([
+            [
+                (0, h),
+                (w, h),
+                (int(w), int(h * 0.55)),
+                (int(0), int(h * 0.55))
+            ]
+        ], dtype=np.int32)
+
+        cv2.fillPoly(
+            roi_mask,
+            polygon,
+            255
+        )
+
+        return cv2.bitwise_and(mask, roi_mask)
+
+
+    # ==================================================
+    # DASHED WHITE CENTERLINE DETECTION
+    #
+    # Only ever marks our own lane, so it can be used to
+    # find the lane center without the ambiguity of
+    # picking between multiple yellow edges.
+    # ==================================================
+
+    def detect_center_line(self, frame):
+
+        h, w = frame.shape[:2]
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        lower_white = np.array([0, 0, 180])
+        upper_white = np.array([180, 60, 255])
+
+        white_mask = cv2.inRange(
+            hsv,
+            lower_white,
+            upper_white
+        )
+
+        kernel = np.ones((5, 5), np.uint8)
+
+        white_mask = cv2.morphologyEx(
+            white_mask,
+            cv2.MORPH_OPEN,
+            kernel
+        )
+
+        white_mask = cv2.morphologyEx(
+            white_mask,
+            cv2.MORPH_CLOSE,
+            kernel
+        )
+
+        roi = self.apply_roi(white_mask, h, w)
+
+        # Dashes are short, so allow shorter segments and
+        # bridge the gaps between them.
+
+        lines = cv2.HoughLinesP(
+            roi,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=20,
+            minLineLength=15,
+            maxLineGap=60
+        )
+
+        if lines is None:
+            return None
+
+        candidates = []
+
+        for line in lines:
+
+            x1, y1, x2, y2 = line[0]
+
+            if x2 == x1:
+                continue
+
+            slope = (y2 - y1) / (x2 - x1)
+
+            # Ignore near-horizontal segments - those are
+            # crosswalk stripes, not the lane centerline.
+            if abs(slope) < 0.5:
+                continue
+
+            candidates.append((x1, y1, x2, y2))
+
+        if not candidates:
+            return None
+
+        def avg_x(line):
+            return (line[0] + line[2]) / 2
+
+        if self.center_line_x is not None:
+
+            # Only trust segments near where we last saw
+            # the centerline. Without this, a dashed line
+            # belonging to a different part of the road
+            # (visible again after the U-turn, say) could
+            # hijack the estimate.
+
+            tolerance = 80  # pixels
+
+            near = [
+                l for l in candidates
+                if abs(avg_x(l) - self.center_line_x) <= tolerance
+            ]
+
+            candidates = near if near else [
+                min(
+                    candidates,
+                    key=lambda l: abs(avg_x(l) - self.center_line_x)
+                )
+            ]
+
+        return self.average_line(candidates)
 
 
     # ==================================================
