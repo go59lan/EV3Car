@@ -34,7 +34,7 @@ class RobotController:
         # P-control
         # -----------------------------
 
-        self.Kp = 0.8
+        self.Kp = 0.6
 
         # -----------------------------
         # Smoothing for the detected
@@ -44,7 +44,7 @@ class RobotController:
         # -----------------------------
 
         self.cx_filtered = None
-        self.smoothing = 0.7  # higher = less smoothing
+        self.smoothing = 0.5  # higher = less smoothing
 
         # -----------------------------
         # Driving speed
