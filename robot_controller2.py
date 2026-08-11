@@ -50,7 +50,7 @@ class RobotController:
         # Driving speed
         # -----------------------------
 
-        self.speed = 20
+        self.speed = 15
 
 
     def run(self):
@@ -182,8 +182,8 @@ class RobotController:
 
                 # Limit steering correction
                 correction = max(
-                    min(correction, 100),
-                    -100
+                    min(correction, 130),
+                    -130
                 )
 
                 # --------------------------------------

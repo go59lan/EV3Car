@@ -20,7 +20,7 @@ while True:
         steer_motor.on_to_position(SpeedPercent(50), steering)
 
         base_speed = SpeedPercent(speed)
-        diff = SpeedPercent(abs(steering) * speed / 100)
+        diff = SpeedPercent(min(abs(steering) * speed / 100, speed))
 
         if steering > 0:
             left_motor.on(base_speed)
