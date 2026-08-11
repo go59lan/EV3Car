@@ -37,6 +37,16 @@ class RobotController:
         self.Kp = 0.5
 
         # -----------------------------
+        # Smoothing for the detected
+        # road-center (cx). Damps
+        # frame-to-frame jitter from
+        # noisy edge detection.
+        # -----------------------------
+
+        self.cx_filtered = None
+        self.smoothing = 0.4  # higher = less smoothing
+
+        # -----------------------------
         # Driving speed
         # -----------------------------
 
@@ -95,6 +105,20 @@ class RobotController:
                 if left_x is not None and right_x is not None:
 
                     cx = int((left_x + right_x) / 2)
+
+                    # Smooth cx to damp frame-to-frame
+                    # jitter before it reaches the
+                    # controller.
+
+                    if self.cx_filtered is None:
+                        self.cx_filtered = cx
+                    else:
+                        self.cx_filtered = int(
+                            self.smoothing * cx
+                            + (1 - self.smoothing) * self.cx_filtered
+                        )
+
+                    cx = self.cx_filtered
 
                     # Draw road center
                     cv2.circle(
@@ -234,6 +258,12 @@ class RobotController:
                     b"0,0",
                     (EV3_IP, EV3_PORT)
                 )
+
+                # Road lost - drop the stale smoothed
+                # estimate so it doesn't bias the first
+                # reading once the road is found again.
+                self.cx_filtered = None
+                cx = None
 
 
             # ==========================================
@@ -398,22 +428,62 @@ class RobotController:
 
 
         # ----------------------------------------------
-        # Average each side
+        # Keep only the outermost lines on each side.
+        #
+        # Obstacles in the middle of the road (like a
+        # median island) also have yellow borders, and
+        # those inner edges can slip into the same slope
+        # bucket as the true road edge. Averaging with
+        # them pulls the estimated edge toward the
+        # island. Since the island's edges are always
+        # closer to center than the real track boundary,
+        # keeping only the lines nearest the outer extreme
+        # filters the island out.
         # ----------------------------------------------
 
-        left_line = self.average_line(
-            left_lines
+        left_line = self.select_outer_line(
+            left_lines,
+            "left"
         )
 
-        if left_line == None:
+        if left_line is None:
             left_line = (0,0,0,h)
 
-        right_line = self.average_line(
-            right_lines
+        right_line = self.select_outer_line(
+            right_lines,
+            "right"
         )
-        if right_line == None:
+        if right_line is None:
             right_line = (w,0,w,h)
         return left_line, right_line
+
+
+    # ==================================================
+    # Keep only the lines nearest the outer edge of the
+    # road on the given side, then average those.
+    # ==================================================
+
+    def select_outer_line(self, lines, side):
+
+        if not lines:
+            return None
+
+        def avg_x(line):
+            return (line[0] + line[2]) / 2
+
+        if side == "left":
+            extreme_x = min(avg_x(l) for l in lines)
+        else:
+            extreme_x = max(avg_x(l) for l in lines)
+
+        tolerance = 40  # pixels
+
+        outer_lines = [
+            l for l in lines
+            if abs(avg_x(l) - extreme_x) <= tolerance
+        ]
+
+        return self.average_line(outer_lines)
 
 
     # ==================================================
