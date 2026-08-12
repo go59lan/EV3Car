@@ -43,15 +43,27 @@ try:
             turn_amount = abs(steering) / 100.0
             inner_speed = round(speed * (1.0 - turn_amount))
 
-            if steering > 0:
-                # Right turn: right wheel is the inner wheel.
-                left_speed = speed
-                right_speed = inner_speed
+            # Positive steering means the controller saw the
+            # road center to the LEFT of the camera (error =
+            # camera_center - cx > 0), and steer_motor turns
+            # the front wheels left to match. The drive
+            # differential has to agree with that: the inner
+            # (slower) wheel on a left turn is the LEFT one.
+            # Slowing the right wheel here instead would push
+            # the car right while the front wheels point left,
+            # so the two fight each other - barely noticeable
+            # on gentle curves, but enough to stop the car
+            # completing a sharp turn.
 
-            elif steering < 0:
+            if steering > 0:
                 # Left turn: left wheel is the inner wheel.
                 left_speed = inner_speed
                 right_speed = speed
+
+            elif steering < 0:
+                # Right turn: right wheel is the inner wheel.
+                left_speed = speed
+                right_speed = inner_speed
 
             else:
                 left_speed = speed
