@@ -108,18 +108,27 @@ class RobotController:
 
             y_target = int(h * 0.65)
 
+            left_x = self.x_at_y(left_line, y_target)
+            right_x = self.x_at_y(right_line, y_target)
+
             # Prefer the dashed white centerline when it's
             # visible. It only ever marks our own lane, so
             # unlike the yellow edges it can't be confused
             # with a yellow border belonging to a different
             # part of the road (e.g. a segment that comes
             # back into view right after the U-turn).
+            #
+            # Pass in the yellow edges so the detector can
+            # reject anything outside the road - e.g. the
+            # mat's own white border, which is not the
+            # centerline but is also white.
 
-            center_line = self.detect_center_line(frame)
+            center_line = self.detect_center_line(
+                frame,
+                left_x,
+                right_x
+            )
             white_x = self.x_at_y(center_line, y_target)
-
-            left_x = self.x_at_y(left_line, y_target)
-            right_x = self.x_at_y(right_line, y_target)
 
             # Only trust the yellow-edge midpoint when both
             # edges were genuinely detected this frame -
@@ -558,7 +567,7 @@ class RobotController:
     # picking between multiple yellow edges.
     # ==================================================
 
-    def detect_center_line(self, frame):
+    def detect_center_line(self, frame, left_x=None, right_x=None):
 
         h, w = frame.shape[:2]
 
@@ -627,6 +636,27 @@ class RobotController:
 
         def avg_x(line):
             return (line[0] + line[2]) / 2
+
+        if left_x is not None and right_x is not None:
+
+            # The centerline can only be inside the road.
+            # This is what actually keeps the detector from
+            # locking onto the mat's own white border,
+            # which sits outside the yellow edges and would
+            # otherwise look just like a valid white line.
+
+            road_min = min(left_x, right_x)
+            road_max = max(left_x, right_x)
+
+            inside = [
+                l for l in candidates
+                if road_min <= avg_x(l) <= road_max
+            ]
+
+            if not inside:
+                return None
+
+            candidates = inside
 
         if self.center_line_x is not None:
 
