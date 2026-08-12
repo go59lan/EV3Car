@@ -57,7 +57,7 @@ class RobotController:
         # Driving speed
         # -----------------------------
 
-        self.speed = 15
+        self.speed = 10
 
 
     def run(self):
