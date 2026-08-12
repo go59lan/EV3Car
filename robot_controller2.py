@@ -118,69 +118,73 @@ class RobotController:
             center_line = self.detect_center_line(frame)
             white_x = self.x_at_y(center_line, y_target)
 
-            if left_line is not None and right_line is not None:
+            left_x = self.x_at_y(left_line, y_target)
+            right_x = self.x_at_y(right_line, y_target)
 
-                left_x = self.x_at_y(left_line, y_target)
-                right_x = self.x_at_y(right_line, y_target)
+            # Only trust the yellow-edge midpoint when both
+            # edges were genuinely detected this frame -
+            # never mix one real edge with the other side
+            # missing, since there's nothing to average it
+            # against.
 
-                if white_x is not None:
-                    cx = white_x
-                elif left_x is not None and right_x is not None:
-                    cx = int((left_x + right_x) / 2)
+            if white_x is not None:
+                cx = white_x
+            elif left_x is not None and right_x is not None:
+                cx = int((left_x + right_x) / 2)
+            else:
+                cx = None
+
+            if cx is not None:
+
+                self.center_line_x = cx
+
+                # Smooth cx to damp frame-to-frame
+                # jitter before it reaches the
+                # controller.
+
+                if self.cx_filtered is None:
+                    self.cx_filtered = cx
                 else:
-                    cx = None
-
-                if cx is not None:
-
-                    self.center_line_x = cx
-
-                    # Smooth cx to damp frame-to-frame
-                    # jitter before it reaches the
-                    # controller.
-
-                    if self.cx_filtered is None:
-                        self.cx_filtered = cx
-                    else:
-                        self.cx_filtered = int(
-                            self.smoothing * cx
-                            + (1 - self.smoothing) * self.cx_filtered
-                        )
-
-                    cx = self.cx_filtered
-
-                    # Draw road center
-                    cv2.circle(
-                        frame,
-                        (cx, y_target),
-                        10,
-                        (255, 0, 0),
-                        -1
+                    self.cx_filtered = int(
+                        self.smoothing * cx
+                        + (1 - self.smoothing) * self.cx_filtered
                     )
 
-                    # Draw the two detected road edges
+                cx = self.cx_filtered
+
+                # Draw road center
+                cv2.circle(
+                    frame,
+                    (cx, y_target),
+                    10,
+                    (255, 0, 0),
+                    -1
+                )
+
+                # Draw the detected road edges, when found
+                self.draw_line(
+                    frame,
+                    left_line,
+                    y_target,
+                    (0, 255, 0)
+                )
+
+                self.draw_line(
+                    frame,
+                    right_line,
+                    y_target,
+                    (0, 255, 0)
+                )
+
+                # Draw the detected centerline, when
+                # found, in magenta for debugging.
+                if center_line is not None:
                     self.draw_line(
                         frame,
-                        left_line,
+                        center_line,
                         y_target,
-                        (0, 255, 0)
+                        (255, 0, 255)
                     )
-
-                    self.draw_line(
-                        frame,
-                        right_line,
-                        y_target,
-                        (0, 255, 0)
-                    )
-
-                    # Draw the detected centerline, when
-                    # found, in magenta for debugging.
-                    if center_line is not None:
-                        self.draw_line(
-                            frame,
-                            center_line,
-                            y_target,
-                            (255, 0, 255)
-                        )
 
 
             # ==========================================
@@ -470,20 +474,24 @@ class RobotController:
         # filters the island out.
         # ----------------------------------------------
 
+        # Note: these are left as None when nothing was
+        # genuinely detected on that side. Do not
+        # fabricate a fallback line at the frame's edge -
+        # treating "edge of the camera image" as if it
+        # were the real road edge badly skews the road-
+        # center estimate whenever only one side is
+        # actually visible (e.g. mid-turn).
+
         left_line = self.select_outer_line(
             left_lines,
             "left"
         )
 
-        if left_line is None:
-            left_line = (0,0,0,h)
-
         right_line = self.select_outer_line(
             right_lines,
             "right"
         )
-        if right_line is None:
-            right_line = (w,0,w,h)
+
         return left_line, right_line
 
 
