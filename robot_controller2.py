@@ -1,3 +1,4 @@
+import time
 import cv2
 import socket
 import numpy as np
@@ -8,787 +9,680 @@ EV3_PORT = 5000
 
 
 class RobotController:
+    """Road follower for a gray road with yellow edges and a dashed white center."""
 
     def __init__(self):
-
-        # -----------------------------
-        # Camera
-        # -----------------------------
-
         self.cap = None
         self.latest_frame = None
-
-        # -----------------------------
-        # Robot state
-        # -----------------------------
-
         self.running = False
-
-        # -----------------------------
-        # UDP connection to EV3
-        # -----------------------------
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        # -----------------------------
-        # P-control
-        # -----------------------------
-
+        # P control is enough once the image measurement is stable.
         self.Kp = 0.6
 
-        # -----------------------------
-        # Smoothing for the detected
-        # road-center (cx). Damps
-        # frame-to-frame jitter from
-        # noisy edge detection.
-        # -----------------------------
-
+        # Center smoothing and steering rate limiting prevent one bad frame
+        # from commanding a sudden full-lock turn.
         self.cx_filtered = None
-        self.smoothing = 0.5  # higher = less smoothing
-
-        # Last known x position of the lane centerline,
-        # used to keep the white dashed-line detector
-        # locked onto our lane instead of a dashed line
-        # belonging to a different part of the road.
-
-        self.center_line_x = None
-
-        # -----------------------------
-        # Driving speed
-        # -----------------------------
+        self.center_new_weight = 0.35
+        self.last_correction = 0
+        self.max_steering_step = 8
 
         self.speed = 10
+        self.turn_speed = 7
+        self.recovery_speed = 5
+        self.recovery_seconds = 0.35
+        self.lost_since = None
 
+        # Geometry learned while both yellow borders are visible.
+        self.lane_width = None
+        self.last_left_x = None
+        self.last_right_x = None
+
+        # White-line history is kept separately from the general road center.
+        # A yellow midpoint must not silently become a "previous white line".
+        self.last_white_x = None
+        self.white_missing_frames = 0
+        self.last_trusted_center = None
+        self.center_missing_frames = 0
 
     def run(self):
-
         self.running = True
-
         self.cap = cv2.VideoCapture(0)
 
         if not self.cap.isOpened():
             print("Could not open camera")
             self.running = False
             return
-        cx = None
-        while self.running:
 
-            # ==========================================
-            # 1. Capture frame
-            # ==========================================
+        try:
+            while self.running:
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("No camera frame")
+                    continue
 
-            ret, frame = self.cap.read()
+                h, w = frame.shape[:2]
+                y_target = int(h * 0.65)
 
-            if not ret:
-                print("No camera frame")
-                continue
-
-            h, w = frame.shape[:2]
-
-
-            # ==========================================
-            # 2. Detect road edges
-            # ==========================================
-
-            left_line, right_line = self.detect_road(frame)
-
-
-            # ==========================================
-            # 3. Calculate road center
-            # ==========================================
-
-            # Look further ahead (closer to the top of the
-            # ROI) rather than right at the car. A
-            # near-field target makes the error collapse
-            # as soon as the car starts turning its nose
-            # into a curve, even though the turn isn't
-            # finished yet - causing the correction to
-            # snap back too early on sharp curves like the
-            # U-turn.
-
-            y_target = int(h * 0.65)
-
-            left_x = self.x_at_y(left_line, y_target)
-            right_x = self.x_at_y(right_line, y_target)
-
-            # Prefer the dashed white centerline when it's
-            # visible. It only ever marks our own lane, so
-            # unlike the yellow edges it can't be confused
-            # with a yellow border belonging to a different
-            # part of the road (e.g. a segment that comes
-            # back into view right after the U-turn).
-            #
-            # Pass in the yellow edges so the detector can
-            # reject anything outside the road - e.g. the
-            # mat's own white border, which is not the
-            # centerline but is also white.
-
-            center_line = self.detect_center_line(
-                frame,
-                left_x,
-                right_x
-            )
-            white_x = self.x_at_y(center_line, y_target)
-
-            # Only trust the yellow-edge midpoint when both
-            # edges were genuinely detected this frame -
-            # never mix one real edge with the other side
-            # missing, since there's nothing to average it
-            # against.
-
-            if white_x is not None:
-                cx = white_x
-            elif left_x is not None and right_x is not None:
-                cx = int((left_x + right_x) / 2)
-            else:
+                # Everything is recalculated on each frame. Never reuse an old
+                # cx as if it were a new camera measurement.
                 cx = None
+                source = "none"
 
-            if cx is not None:
+                left_line, right_line, yellow_mask = self.detect_road(frame)
+                yellow_center, yellow_mode = self.center_from_yellow(
+                    left_line, right_line, y_target, w
+                )
 
-                self.center_line_x = cx
+                center_line, white_mask = self.detect_center_line(
+                    frame=frame,
+                    left_line=left_line,
+                    right_line=right_line,
+                    expected_center=yellow_center,
+                    y_target=y_target,
+                )
+                white_x = self.x_at_y(center_line, y_target)
 
-                # Smooth cx to damp frame-to-frame
-                # jitter before it reaches the
-                # controller.
-
-                if self.cx_filtered is None:
-                    self.cx_filtered = cx
+                if white_x is not None:
+                    self.last_white_x = white_x
+                    self.white_missing_frames = 0
                 else:
-                    self.cx_filtered = int(
-                        self.smoothing * cx
-                        + (1 - self.smoothing) * self.cx_filtered
+                    self.white_missing_frames += 1
+                    if self.white_missing_frames > 20:
+                        self.last_white_x = None
+
+                # A white line is used only after detect_center_line has passed
+                # the yellow-corridor, continuity, and dashed-pattern checks.
+                if white_x is not None:
+                    cx = float(white_x)
+                    source = "white dash"
+                elif yellow_center is not None:
+                    cx = float(yellow_center)
+                    source = "yellow " + yellow_mode
+
+                if cx is not None:
+                    self.lost_since = None
+                    self.center_missing_frames = 0
+                    self.last_trusted_center = cx
+
+                    if self.cx_filtered is None:
+                        self.cx_filtered = cx
+                    else:
+                        a = self.center_new_weight
+                        self.cx_filtered = a * cx + (1.0 - a) * self.cx_filtered
+
+                    cx = self.cx_filtered
+                    camera_center = w / 2.0
+                    error = camera_center - cx
+
+                    desired = int(np.clip(self.Kp * error, -100, 100))
+                    correction = self.limit_steering_change(desired)
+
+                    speed = self.speed
+                    if abs(correction) >= 45 or yellow_mode != "both":
+                        speed = self.turn_speed
+
+                    self.send_command(correction, speed)
+                    self.draw_tracking(
+                        frame, cx, y_target, error, correction, speed, source
                     )
+                else:
+                    self.center_missing_frames += 1
+                    if self.center_missing_frames > 20:
+                        self.last_trusted_center = None
+                        self.cx_filtered = None
+                    self.recover_or_stop(frame)
 
-                cx = self.cx_filtered
-
-                # Draw road center
-                cv2.circle(
+                camera_center = w // 2
+                cv2.line(
                     frame,
-                    (cx, y_target),
-                    10,
+                    (camera_center, h - 1),
+                    (camera_center, int(h * 0.52)),
                     (255, 0, 0),
-                    -1
+                    2,
                 )
 
-                # Draw the detected road edges, when found
-                self.draw_line(
-                    frame,
-                    left_line,
-                    y_target,
-                    (0, 255, 0)
-                )
-
-                self.draw_line(
-                    frame,
-                    right_line,
-                    y_target,
-                    (0, 255, 0)
-                )
-
-                # Draw the detected centerline, when
-                # found, in magenta for debugging.
+                if left_line is not None:
+                    self.draw_line(frame, left_line, y_target, (0, 255, 0))
+                if right_line is not None:
+                    self.draw_line(frame, right_line, y_target, (0, 255, 0))
                 if center_line is not None:
-                    self.draw_line(
-                        frame,
-                        center_line,
-                        y_target,
-                        (255, 0, 255)
-                    )
+                    self.draw_line(frame, center_line, y_target, (255, 0, 255))
 
+                self.draw_mask_previews(frame, yellow_mask, white_mask)
 
-            # ==========================================
-            # 4. P-control / navigation
-            # ==========================================
+                success, jpeg = cv2.imencode(".jpg", frame)
+                if success:
+                    self.latest_frame = jpeg.tobytes()
+        finally:
+            self.stop()
 
-            camera_center = w // 2
-
-            # Camera center line
-            cv2.line(
-                frame,
-                (camera_center, h),
-                (camera_center, int(h * 0.55)),
-                (255, 0, 0),
-                2
-            )
-
-
-            if cx is not None:
-
-                # --------------------------------------
-                # Error
-                # --------------------------------------
-
-                error = camera_center - cx
-
-                # --------------------------------------
-                # P-control
-                # --------------------------------------
-
-                correction = int(self.Kp * error)
-
-                # Limit steering correction
-                correction = max(
-                    min(correction, 100),
-                    -100
-                )
-
-                # --------------------------------------
-                # Send command to EV3
-                # --------------------------------------
-
-                msg = f"{correction},{self.speed}".encode()
-
-                self.sock.sendto(
-                    msg,
-                    (EV3_IP, EV3_PORT)
-                )
-
-                print(
-                    f"Sending to EV3: "
-                    f"cx={cx}, "
-                    f"error={error}, "
-                    f"correction={correction}, "
-                    f"speed={self.speed}"
-                )
-
-                # --------------------------------------
-                # Debug text
-                # --------------------------------------
-
-                cv2.putText(
-                    frame,
-                    f"Road center: {cx}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2
-                )
-
-                cv2.putText(
-                    frame,
-                    f"Error: {error}",
-                    (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2
-                )
-
-                cv2.putText(
-                    frame,
-                    f"Correction: {correction}",
-                    (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2
-                )
-
-                cv2.putText(
-                    frame,
-                    f"Source: {'white line' if white_x is not None else 'yellow edges'}",
-                    (10, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2
-                )
-
-            else:
-
-                # ======================================
-                # No road detected
-                # ======================================
-
-                cv2.putText(
-                    frame,
-                    "ROAD NOT DETECTED",
-                    (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 0, 255),
-                    2
-                )
-
-                # IMPORTANT:
-                # Do not keep driving blindly if we
-                # cannot see both road edges.
-
-                self.sock.sendto(
-                    b"0,0",
-                    (EV3_IP, EV3_PORT)
-                )
-
-                # Road lost - drop the stale smoothed
-                # estimate so it doesn't bias the first
-                # reading once the road is found again.
-                self.cx_filtered = None
-                self.center_line_x = None
-                cx = None
-
-
-            # ==========================================
-            # 5. Encode frame for Flask
-            # ==========================================
-
-            success, jpeg = cv2.imencode(
-                ".jpg",
-                frame
-            )
-
-            if success:
-                self.latest_frame = jpeg.tobytes()
-
-
-        # ==============================================
-        # 6. Cleanup
-        # ==============================================
-
-        self.stop()
-
-
-    # ==================================================
-    # ROAD DETECTION
-    # ==================================================
+    # ------------------------------------------------------------------
+    # Yellow road-border detection
+    # ------------------------------------------------------------------
 
     def detect_road(self, frame):
-
         h, w = frame.shape[:2]
-
-        # ----------------------------------------------
-        # Grayscale
-        # ----------------------------------------------
-
-        # gray = cv2.cvtColor(
-        #     frame,
-        #     cv2.COLOR_BGR2GRAY
-        # )
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        lower_yellow = np.array([15, 80, 80])
-        upper_yellow = np.array([40, 255, 255])
 
         yellow_mask = cv2.inRange(
             hsv,
-            lower_yellow,
-            upper_yellow
+            np.array([14, 70, 65], dtype=np.uint8),
+            np.array([42, 255, 255], dtype=np.uint8),
         )
 
-        kernel = np.ones((5, 5), np.uint8)
-
+        # A small kernel preserves thin yellow fragments at the frame edges.
+        kernel = np.ones((3, 3), np.uint8)
         yellow_mask = cv2.morphologyEx(
-            yellow_mask,
-            cv2.MORPH_OPEN,
-            kernel
+            yellow_mask, cv2.MORPH_OPEN, kernel, iterations=1
         )
-
         yellow_mask = cv2.morphologyEx(
-            yellow_mask,
-            cv2.MORPH_CLOSE,
-            kernel
+            yellow_mask, cv2.MORPH_CLOSE, kernel, iterations=2
         )
 
-
-        # ----------------------------------------------
-        # Region Of Interest
-        #
-        # Only look at the lower part of the image.
-        #
-        #        camera
-        #    ______________
-        #   |              |
-        #   |              |
-        #   |              |
-        #   |    ______    |
-        #   |   /      \   |
-        #   |  /        \  |
-        #   |_/__________\_|
-        # ----------------------------------------------
-
-        roi = self.apply_roi(yellow_mask, h, w)
-
-        # ----------------------------------------------
-        # Hough line detection
-        # ----------------------------------------------
+        roi_top = int(h * 0.50)
+        roi = self.apply_roi(yellow_mask, roi_top)
 
         lines = cv2.HoughLinesP(
             roi,
             rho=1,
             theta=np.pi / 180,
-            threshold=30,
-            minLineLength=30,
-            maxLineGap=20
+            threshold=16,
+            minLineLength=14,
+            maxLineGap=35,
         )
 
         if lines is None:
-            return None, None
+            return None, None, yellow_mask
 
-
-        left_lines = []
-        right_lines = []
-
-
-        # ----------------------------------------------
-        # Separate left and right lines
-        # ----------------------------------------------
-
-        for line in lines:
-
-            x1, y1, x2, y2 = line[0]
-
-            # Avoid division by zero
-            if x2 == x1:
-                continue
-
-            slope = (
-                (y2 - y1)
-                / (x2 - x1)
-            )
-
-            # Ignore almost-horizontal lines
-            if abs(slope) < 0.5:
-                continue
-
-            # In image coordinates:
-            #
-            # Left road edge generally has
-            # negative slope.
-            #
-            # Right road edge generally has
-            # positive slope.
-
-            if slope < 0:
-                left_lines.append(
-                    (x1, y1, x2, y2)
-                )
-
-            else:
-                right_lines.append(
-                    (x1, y1, x2, y2)
-                )
-
-
-        # ----------------------------------------------
-        # Keep only the outermost lines on each side.
-        #
-        # Obstacles in the middle of the road (like a
-        # median island) also have yellow borders, and
-        # those inner edges can slip into the same slope
-        # bucket as the true road edge. Averaging with
-        # them pulls the estimated edge toward the
-        # island. Since the island's edges are always
-        # closer to center than the real track boundary,
-        # keeping only the lines nearest the outer extreme
-        # filters the island out.
-        # ----------------------------------------------
-
-        # Note: these are left as None when nothing was
-        # genuinely detected on that side. Do not
-        # fabricate a fallback line at the frame's edge -
-        # treating "edge of the camera image" as if it
-        # were the real road edge badly skews the road-
-        # center estimate whenever only one side is
-        # actually visible (e.g. mid-turn).
-
-        left_line = self.select_outer_line(
-            left_lines,
-            "left"
-        )
-
-        right_line = self.select_outer_line(
-            right_lines,
-            "right"
-        )
-
-        return left_line, right_line
-
-
-    # ==================================================
-    # Keep only the lines nearest the outer edge of the
-    # road on the given side, then average those.
-    # ==================================================
-
-    def select_outer_line(self, lines, side):
-
-        if not lines:
-            return None
-
-        def avg_x(line):
-            return (line[0] + line[2]) / 2
-
-        if side == "left":
-            extreme_x = min(avg_x(l) for l in lines)
-        else:
-            extreme_x = max(avg_x(l) for l in lines)
-
-        tolerance = 40  # pixels
-
-        outer_lines = [
-            l for l in lines
-            if abs(avg_x(l) - extreme_x) <= tolerance
-        ]
-
-        return self.average_line(outer_lines)
-
-
-    # ==================================================
-    # Mask a binary image down to the road ROI
-    # (lower part of the frame).
-    # ==================================================
-
-    def apply_roi(self, mask, h, w):
-
-        roi_mask = np.zeros_like(mask)
-
-        polygon = np.array([
-            [
-                (0, h),
-                (w, h),
-                (int(w), int(h * 0.55)),
-                (int(0), int(h * 0.55))
-            ]
-        ], dtype=np.int32)
-
-        cv2.fillPoly(
-            roi_mask,
-            polygon,
-            255
-        )
-
-        return cv2.bitwise_and(mask, roi_mask)
-
-
-    # ==================================================
-    # DASHED WHITE CENTERLINE DETECTION
-    #
-    # Only ever marks our own lane, so it can be used to
-    # find the lane center without the ambiguity of
-    # picking between multiple yellow edges.
-    # ==================================================
-
-    def detect_center_line(self, frame, left_x=None, right_x=None):
-
-        h, w = frame.shape[:2]
-
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        lower_white = np.array([0, 0, 180])
-        upper_white = np.array([180, 60, 255])
-
-        white_mask = cv2.inRange(
-            hsv,
-            lower_white,
-            upper_white
-        )
-
-        kernel = np.ones((5, 5), np.uint8)
-
-        white_mask = cv2.morphologyEx(
-            white_mask,
-            cv2.MORPH_OPEN,
-            kernel
-        )
-
-        white_mask = cv2.morphologyEx(
-            white_mask,
-            cv2.MORPH_CLOSE,
-            kernel
-        )
-
-        roi = self.apply_roi(white_mask, h, w)
-
-        # Dashes are short, so allow shorter segments and
-        # bridge the gaps between them.
-
-        lines = cv2.HoughLinesP(
-            roi,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=20,
-            minLineLength=15,
-            maxLineGap=60
-        )
-
-        if lines is None:
-            return None
-
+        y_reference = int(h * 0.70)
         candidates = []
 
-        for line in lines:
+        for detected in lines[:, 0]:
+            segment = self.normalize_segment(tuple(map(int, detected)))
+            x1, y1, x2, y2 = segment
+            dx = x2 - x1
+            dy = y2 - y1
+            length = float(np.hypot(dx, dy))
 
-            x1, y1, x2, y2 = line[0]
-
-            if x2 == x1:
+            # This accepts vertical lines. The original `x2 == x1: continue`
+            # discarded exactly the lines seen on a straight road.
+            if length < 14 or abs(dy) < 8 or abs(dy) < 0.35 * abs(dx):
                 continue
 
-            slope = (y2 - y1) / (x2 - x1)
-
-            # Ignore near-horizontal segments - those are
-            # crosswalk stripes, not the lane centerline.
-            if abs(slope) < 0.5:
+            x_reference = self.x_at_y(segment, y_reference)
+            if x_reference is None or not (-w <= x_reference <= 2 * w):
                 continue
 
-            candidates.append((x1, y1, x2, y2))
+            candidates.append((x_reference, length, segment))
 
         if not candidates:
-            return None
+            return None, None, yellow_mask
 
-        def avg_x(line):
-            return (line[0] + line[2]) / 2
+        # Merge repeated Hough segments from the same painted line, but keep
+        # nearby lines from different road sections as separate candidates.
+        clusters = self.cluster_segments(candidates, max(14, int(w * 0.04)))
+
+        # A different part of the road can also be visible in the camera,
+        # especially around a U-turn. Do not select the outermost yellow
+        # clusters. Split them at the image center and keep only the innermost
+        # cluster on each side:
+        #
+        #   left side  -> greatest X (closest to the middle)
+        #   right side -> smallest X (closest to the middle)
+        #
+        # If all clusters are on the same side, this deliberately returns only
+        # one line. For example, with two lines on the left, the line closer to
+        # the middle is kept and the real right border is treated as out of view.
+
+        left_cluster, right_cluster = self.select_center_side_clusters(
+            clusters, w
+        )
+
+        left_line = self.fit_cluster(left_cluster, roi_top, h - 1)
+        right_line = self.fit_cluster(right_cluster, roi_top, h - 1)
+
+        return left_line, right_line, yellow_mask
+
+    def center_from_yellow(self, left_line, right_line, y_target, image_width):
+        left_x = self.x_at_y(left_line, y_target)
+        right_x = self.x_at_y(right_line, y_target)
 
         if left_x is not None and right_x is not None:
+            if right_x < left_x:
+                left_x, right_x = right_x, left_x
 
-            # The centerline can only be inside the road.
-            # This is what actually keeps the detector from
-            # locking onto the mat's own white border,
-            # which sits outside the yellow edges and would
-            # otherwise look just like a valid white line.
+            measured_width = right_x - left_x
+            if measured_width >= image_width * 0.20:
+                measured_width = float(
+                    np.clip(
+                        measured_width,
+                        image_width * 0.25,
+                        image_width * 1.60,
+                    )
+                )
+                if self.lane_width is None:
+                    self.lane_width = measured_width
+                else:
+                    self.lane_width = 0.85 * self.lane_width + 0.15 * measured_width
+
+                self.last_left_x = left_x
+                self.last_right_x = right_x
+                return (left_x + right_x) / 2.0, "both"
+
+        # If only one border is visible, infer the center from the road width
+        # learned on previous frames. Never invent the missing line at x=0/w.
+        if self.lane_width is not None:
+            if left_x is not None:
+                self.last_left_x = left_x
+                return left_x + self.lane_width / 2.0, "left only"
+            if right_x is not None:
+                self.last_right_x = right_x
+                return right_x - self.lane_width / 2.0, "right only"
+
+        return None, "lost"
+
+    # ------------------------------------------------------------------
+    # Dashed white center-line detection
+    # ------------------------------------------------------------------
+
+    def detect_center_line(
+        self,
+        frame,
+        left_line=None,
+        right_line=None,
+        expected_center=None,
+        y_target=None,
+    ):
+        h, w = frame.shape[:2]
+        if y_target is None:
+            y_target = int(h * 0.65)
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        white_mask = cv2.inRange(
+            hsv,
+            np.array([0, 0, 175], dtype=np.uint8),
+            np.array([179, 65, 255], dtype=np.uint8),
+        )
+
+        kernel = np.ones((3, 3), np.uint8)
+        white_mask = cv2.morphologyEx(
+            white_mask, cv2.MORPH_OPEN, kernel, iterations=1
+        )
+        white_mask = cv2.morphologyEx(
+            white_mask, cv2.MORPH_CLOSE, kernel, iterations=1
+        )
+
+        roi_top = int(h * 0.50)
+        roi = self.apply_roi(white_mask, roi_top)
+
+        # Keep dashes separate. A large maxLineGap can turn a dashed line and a
+        # solid mat border into similarly long Hough lines.
+        lines = cv2.HoughLinesP(
+            roi,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=12,
+            minLineLength=10,
+            maxLineGap=22,
+        )
+
+        if lines is None:
+            return None, white_mask
+
+        reference = expected_center
+        if reference is None:
+            reference = self.last_trusted_center
+        if reference is None:
+            reference = self.last_white_x
+        if reference is None:
+            # Conservative first acquisition: a center dash should begin near
+            # the camera center. An outside mat border should not.
+            reference = w / 2.0
+            reference_limit = w * 0.20
+        else:
+            reference_limit = max(45.0, w * 0.15)
+
+        accepted = []
+
+        for detected in lines[:, 0]:
+            segment = self.normalize_segment(tuple(map(int, detected)))
+            x1, y1, x2, y2 = segment
+            dx = x2 - x1
+            dy = y2 - y1
+            length = float(np.hypot(dx, dy))
+
+            # Reject horizontal mat markings but retain vertical center dashes.
+            if length < 10 or abs(dy) < 7 or abs(dy) < 0.35 * abs(dx):
+                continue
+
+            candidate_x = self.x_at_y(segment, y_target)
+            if candidate_x is None or not (0 <= candidate_x < w):
+                continue
+
+            reference_error = abs(candidate_x - reference)
+            if reference_error > reference_limit:
+                continue
+
+            # Hard temporal gate. The previous version picked the nearest line
+            # even when every candidate was far away, which let the map border
+            # hijack the detector in a single frame.
+            temporal_error = 0.0
+            if self.last_white_x is not None:
+                temporal_error = abs(candidate_x - self.last_white_x)
+                if temporal_error > max(55.0, w * 0.14):
+                    continue
+
+            center_error = self.center_band_error(
+                segment, left_line, right_line, w
+            )
+            if center_error is None and left_line is not None and right_line is not None:
+                # Both yellow borders exist but this white candidate could not
+                # be proven to lie between them at matching Y-coordinates.
+                continue
+            if center_error is not None and center_error > 0.32:
+                # 0 means the exact yellow midpoint; 0.5 means a yellow edge.
+                # The dashed line must stay in the central part of the road.
+                continue
+
+            occupancy, longest_run_ratio = self.line_pattern(
+                white_mask, segment, roi_top, h - 1
+            )
+            if occupancy > 0.80 and longest_run_ratio > 0.65:
+                # A solid white map border remains white for most of the ROI.
+                # A dashed center line necessarily contains visible gaps.
+                continue
+
+            geometry_penalty = 0.0 if center_error is None else center_error * w
+            solid_penalty = max(0.0, occupancy - 0.55) * 80.0
+            score = (
+                reference_error
+                + 0.35 * temporal_error
+                + geometry_penalty
+                + solid_penalty
+                - min(length, 80.0) * 0.05
+            )
+            accepted.append((score, candidate_x, length, segment))
+
+        if not accepted:
+            return None, white_mask
+
+        accepted.sort(key=lambda item: item[0])
+        best_x = accepted[0][1]
+
+        # Combine only segments belonging to the winning dash trajectory.
+        matching = [
+            (item[1], item[2], item[3])
+            for item in accepted
+            if abs(item[1] - best_x) <= max(18, int(w * 0.045))
+        ]
+        center_line = self.fit_cluster(matching, roi_top, h - 1)
+
+        final_x = self.x_at_y(center_line, y_target)
+        if final_x is None or abs(final_x - reference) > reference_limit:
+            return None, white_mask
+
+        return center_line, white_mask
+
+    def center_band_error(self, candidate, left_line, right_line, image_width):
+        """Compare white and yellow geometry at identical image heights."""
+        if left_line is None or right_line is None:
+            return None
+
+        _, y1, _, y2 = candidate
+        sample_y_values = (y1, (y1 + y2) // 2, y2)
+        normalized_errors = []
+
+        for y in sample_y_values:
+            white_x = self.x_at_y(candidate, y)
+            left_x = self.x_at_y(left_line, y)
+            right_x = self.x_at_y(right_line, y)
+            if white_x is None or left_x is None or right_x is None:
+                continue
 
             road_min = min(left_x, right_x)
             road_max = max(left_x, right_x)
+            road_width = road_max - road_min
+            if road_width < image_width * 0.15:
+                continue
 
-            inside = [
-                l for l in candidates
-                if road_min <= avg_x(l) <= road_max
-            ]
+            road_center = (road_min + road_max) / 2.0
+            normalized_errors.append(abs(white_x - road_center) / road_width)
 
-            if not inside:
-                return None
-
-            candidates = inside
-
-        if self.center_line_x is not None:
-
-            # Only trust segments near where we last saw
-            # the centerline. Without this, a dashed line
-            # belonging to a different part of the road
-            # (visible again after the U-turn, say) could
-            # hijack the estimate.
-
-            tolerance = 80  # pixels
-
-            near = [
-                l for l in candidates
-                if abs(avg_x(l) - self.center_line_x) <= tolerance
-            ]
-
-            candidates = near if near else [
-                min(
-                    candidates,
-                    key=lambda l: abs(avg_x(l) - self.center_line_x)
-                )
-            ]
-
-        return self.average_line(candidates)
-
-
-    # ==================================================
-    # Average several detected lines
-    # ==================================================
-
-    def average_line(self, lines):
-
-        if not lines:
+        if not normalized_errors:
             return None
+        return float(np.mean(normalized_errors))
 
-        x1 = []
-        y1 = []
-        x2 = []
-        y2 = []
+    def line_pattern(self, mask, line, y_start, y_end):
+        """Measure whether a proposed white line is dashed or continuous."""
+        h, w = mask.shape[:2]
+        samples = []
 
-        for line in lines:
+        for y in range(max(0, y_start), min(h - 1, y_end) + 1, 2):
+            x = self.x_at_y(line, y)
+            if x is None or x < 0 or x >= w:
+                continue
+            x1 = max(0, x - 3)
+            x2 = min(w, x + 4)
+            samples.append(bool(np.any(mask[y, x1:x2] > 0)))
 
-            x1.append(line[0])
-            y1.append(line[1])
-            x2.append(line[2])
-            y2.append(line[3])
+        if not samples:
+            return 0.0, 0.0
 
-        return (
-            int(np.mean(x1)),
-            int(np.mean(y1)),
-            int(np.mean(x2)),
-            int(np.mean(y2))
+        occupied = sum(samples)
+        longest_run = 0
+        current_run = 0
+        for is_white in samples:
+            if is_white:
+                current_run += 1
+                longest_run = max(longest_run, current_run)
+            else:
+                current_run = 0
+
+        return occupied / len(samples), longest_run / len(samples)
+
+    # ------------------------------------------------------------------
+    # Shared image geometry
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def apply_roi(mask, roi_top):
+        roi_mask = np.zeros_like(mask)
+        roi_mask[roi_top:, :] = 255
+        return cv2.bitwise_and(mask, roi_mask)
+
+    @staticmethod
+    def normalize_segment(line):
+        x1, y1, x2, y2 = line
+        if y1 <= y2:
+            return x1, y1, x2, y2
+        return x2, y2, x1, y1
+
+    @staticmethod
+    def cluster_x(cluster):
+        total_weight = sum(item[1] for item in cluster)
+        return sum(item[0] * item[1] for item in cluster) / total_weight
+
+    @staticmethod
+    def cluster_segments(candidates, gap):
+        candidates = sorted(candidates, key=lambda item: item[0])
+        clusters = []
+        for candidate in candidates:
+            if not clusters or candidate[0] - clusters[-1][-1][0] > gap:
+                clusters.append([candidate])
+            else:
+                clusters[-1].append(candidate)
+        return clusters
+
+    def select_center_side_clusters(self, clusters, image_width):
+        """Keep at most one yellow cluster on each side of image center."""
+        image_center = image_width / 2.0
+
+        left_clusters = [
+            cluster
+            for cluster in clusters
+            if self.cluster_x(cluster) < image_center
+        ]
+        right_clusters = [
+            cluster
+            for cluster in clusters
+            if self.cluster_x(cluster) >= image_center
+        ]
+
+        # On the left, a larger X is closer to the middle. On the right, a
+        # smaller X is closer to the middle.
+        left_cluster = (
+            max(left_clusters, key=self.cluster_x)
+            if left_clusters
+            else None
+        )
+        right_cluster = (
+            min(right_clusters, key=self.cluster_x)
+            if right_clusters
+            else None
         )
 
+        return left_cluster, right_cluster
 
-    # ==================================================
-    # Find X coordinate of a line at a given Y
-    # ==================================================
+    @staticmethod
+    def fit_cluster(cluster, y_top, y_bottom):
+        if not cluster:
+            return None
 
-    def x_at_y(self, line, y):
+        points = []
+        for _, _, (x1, y1, x2, y2) in cluster:
+            points.extend(((x1, y1), (x2, y2)))
 
+        points = np.asarray(points, dtype=np.float32)
+        fit = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
+        vx, vy, x0, y0 = [float(value) for value in fit]
+
+        if abs(vy) < 1e-6:
+            return None
+
+        x_top = x0 + (y_top - y0) * vx / vy
+        x_bottom = x0 + (y_bottom - y0) * vx / vy
+        return int(x_top), int(y_top), int(x_bottom), int(y_bottom)
+
+    @staticmethod
+    def x_at_y(line, y):
         if line is None:
             return None
 
         x1, y1, x2, y2 = line
-
         if y2 == y1:
             return None
 
-        # Equation of a line:
-        #
-        # x = x1 + (y-y1) * (x2-x1)/(y2-y1)
+        return int(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
 
-        x = (
-            x1
-            + (y - y1)
-            * (x2 - x1)
-            / (y2 - y1)
+    # ------------------------------------------------------------------
+    # Driving and debug display
+    # ------------------------------------------------------------------
+
+    def limit_steering_change(self, desired):
+        low = self.last_correction - self.max_steering_step
+        high = self.last_correction + self.max_steering_step
+        correction = int(np.clip(desired, low, high))
+        correction = int(np.clip(correction, -100, 100))
+        self.last_correction = correction
+        return correction
+
+    def recover_or_stop(self, frame):
+        now = time.monotonic()
+        if self.lost_since is None:
+            self.lost_since = now
+
+        elapsed = now - self.lost_since
+        if elapsed <= self.recovery_seconds and self.last_correction != 0:
+            # Preserve the turn briefly instead of steering straight at the
+            # exact moment the curve moves out of the narrow camera view.
+            self.send_command(self.last_correction, self.recovery_speed)
+            text = "RECOVERING ROAD"
+            color = (0, 165, 255)
+        else:
+            self.send_command(0, 0)
+            self.last_correction = 0
+            text = "ROAD LOST - STOPPED"
+            color = (0, 0, 255)
+
+        cv2.putText(
+            frame, text, (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2
         )
 
-        return int(x)
+    def send_command(self, correction, speed):
+        message = "{},{}".format(int(correction), int(speed)).encode()
+        self.sock.sendto(message, (EV3_IP, EV3_PORT))
+        print(
+            "Sending to EV3: correction={}, speed={}".format(
+                int(correction), int(speed)
+            )
+        )
 
+    @staticmethod
+    def draw_tracking(frame, cx, y_target, error, correction, speed, source):
+        h, w = frame.shape[:2]
+        draw_x = int(np.clip(cx, 0, w - 1))
+        cv2.circle(frame, (draw_x, y_target), 9, (255, 0, 0), -1)
 
-    # ==================================================
-    # Draw a detected line
-    # ==================================================
+        labels = (
+            "Road center: {:.0f}".format(cx),
+            "Error: {:.0f}".format(error),
+            "Correction: {}  Speed: {}".format(correction, speed),
+            "Source: {}".format(source),
+        )
+        for index, label in enumerate(labels):
+            cv2.putText(
+                frame,
+                label,
+                (10, 28 + index * 27),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (0, 255, 255),
+                2,
+            )
 
-    def draw_line(
-        self,
-        frame,
-        line,
-        y_target,
-        color
-    ):
-
+    def draw_line(self, frame, line, y_target, color):
         if line is None:
             return
 
-        x1, y1, x2, y2 = line
-
-        x_target = self.x_at_y(
-            line,
-            y_target
-        )
-
+        h, w = frame.shape[:2]
+        x1, y1, _, _ = line
+        x_target = self.x_at_y(line, y_target)
         if x_target is None:
             return
 
         cv2.line(
             frame,
-            (x1, y1),
-            (x_target, y_target),
+            (int(np.clip(x1, 0, w - 1)), int(np.clip(y1, 0, h - 1))),
+            (int(np.clip(x_target, 0, w - 1)), y_target),
             color,
-            3
+            3,
         )
 
+    @staticmethod
+    def draw_mask_previews(frame, yellow_mask, white_mask):
+        h, w = frame.shape[:2]
+        preview_w = max(1, w // 5)
+        preview_h = max(1, h // 5)
 
-    # ==================================================
-    # Stop robot
-    # ==================================================
+        yellow = cv2.resize(yellow_mask, (preview_w, preview_h))
+        yellow = cv2.cvtColor(yellow, cv2.COLOR_GRAY2BGR)
+        yellow[:, :, 0] = 0
+
+        white = cv2.resize(white_mask, (preview_w, preview_h))
+        white = cv2.cvtColor(white, cv2.COLOR_GRAY2BGR)
+
+        x1 = w - preview_w
+        frame[0:preview_h, x1:w] = yellow
+        if 2 * preview_h <= h:
+            frame[preview_h:2 * preview_h, x1:w] = white
 
     def stop(self):
-
         self.running = False
-
-        # Tell EV3 to stop
         try:
-            self.sock.sendto(
-                b"0,0",
-                (EV3_IP, EV3_PORT)
-            )
-        except Exception:
+            self.send_command(0, 0)
+        except OSError:
             pass
 
         if self.cap is not None:
@@ -797,11 +691,5 @@ class RobotController:
 
         cv2.destroyAllWindows()
 
-
-    # ==================================================
-    # Get latest frame for Flask
-    # ==================================================
-
     def get_frame(self):
-
         return self.latest_frame
