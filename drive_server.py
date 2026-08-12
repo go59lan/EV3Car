@@ -1,39 +1,80 @@
-
-
 import socket
-from ev3dev2.motor import LargeMotor,MediumMotor,  OUTPUT_A, OUTPUT_B, OUTPUT_C, SpeedPercent
+from ev3dev2.motor import (
+    LargeMotor,
+    MediumMotor,
+    OUTPUT_A,
+    OUTPUT_B,
+    OUTPUT_C,
+    SpeedPercent,
+)
 
 steer_motor = MediumMotor(OUTPUT_A)
 left_motor = LargeMotor(OUTPUT_B)
 right_motor = LargeMotor(OUTPUT_C)
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(('', 5000))
+sock.bind(("", 5000))
 
-while True:
-    data, _ = sock.recvfrom(1024)
-    try:
-        steering_str, speed_str = data.decode().split(',')
-        steering = int(steering_str)
-        speed = int(speed_str)
+print("EV3 drive server listening on UDP port 5000")
 
-        steer_motor.on_to_position(SpeedPercent(50), steering)
+try:
+    while True:
+        data, address = sock.recvfrom(1024)
 
-        base_speed = SpeedPercent(speed)
-        diff = SpeedPercent(abs(steering) * speed / 100)
+        try:
+            steering_str, speed_str = data.decode().strip().split(",")
 
-        if steering > 0:
-            left_motor.on(base_speed)
-            right_motor.on(base_speed - diff)
-        elif steering < 0:
-            left_motor.on(base_speed - diff)
-            right_motor.on(base_speed)
-        else:
-            left_motor.on(base_speed)
-            right_motor.on(base_speed)
+            # Protect the motors from invalid controller values.
+            steering = max(-100, min(100, int(steering_str)))
+            speed = max(0, min(100, int(speed_str)))
 
-    except:
-        left_motor.off()
-        right_motor.off()
-        steer_motor.off()
+            # Move the physical steering motor without blocking drive updates.
+            steer_motor.on_to_position(
+                SpeedPercent(50),
+                steering,
+                block=False,
+            )
 
+            # At steering:
+            #   0   -> inner wheel = +speed
+            #   50  -> inner wheel = 0
+            #   100 -> inner wheel = -speed
+            turn_amount = abs(steering) / 100.0
+            inner_speed = round(speed * (1.0 - 2.0 * turn_amount))
+
+            if steering > 0:
+                # Right turn: right wheel is the inner wheel.
+                left_speed = speed
+                right_speed = inner_speed
+
+            elif steering < 0:
+                # Left turn: left wheel is the inner wheel.
+                left_speed = inner_speed
+                right_speed = speed
+
+            else:
+                left_speed = speed
+                right_speed = speed
+
+            left_motor.on(SpeedPercent(left_speed))
+            right_motor.on(SpeedPercent(right_speed))
+
+            print(
+                f"steering={steering}, "
+                f"left={left_speed}, "
+                f"right={right_speed}"
+            )
+
+        except (ValueError, UnicodeDecodeError) as error:
+            print(f"Invalid command {data!r}: {error}")
+            left_motor.off(brake=True)
+            right_motor.off(brake=True)
+
+except KeyboardInterrupt:
+    print("Stopping EV3 drive server")
+
+finally:
+    left_motor.off(brake=True)
+    right_motor.off(brake=True)
+    steer_motor.off(brake=True)
+    sock.close()
