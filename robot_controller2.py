@@ -228,8 +228,8 @@ class RobotController:
 
                 # Limit steering correction
                 correction = max(
-                    min(correction, 130),
-                    -130
+                    min(correction, 100),
+                    -100
                 )
 
                 # --------------------------------------
