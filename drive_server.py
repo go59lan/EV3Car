@@ -13,6 +13,7 @@ left_motor = LargeMotor(OUTPUT_B)
 right_motor = LargeMotor(OUTPUT_C)
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(2.0)
 sock.bind(("", 5000))
 
 print("EV3 drive server listening on UDP port 5000")
@@ -26,7 +27,7 @@ try:
 
             # Protect the motors from invalid controller values.
             steering = max(-100, min(100, int(steering_str)))
-            speed = max(0, min(100, int(speed_str)))
+            speed = -max(0, min(100, int(speed_str)))
 
             # Move the physical steering motor without blocking drive updates.
             steer_motor.on_to_position(
@@ -40,7 +41,7 @@ try:
             #   50  -> inner wheel = 0
             #   100 -> inner wheel = -speed
             turn_amount = abs(steering) / 100.0
-            inner_speed = round(speed * (1.0 - 2.0 * turn_amount))
+            inner_speed = round(speed * (1.0 - turn_amount))
 
             if steering > 0:
                 # Right turn: right wheel is the inner wheel.
@@ -59,14 +60,7 @@ try:
             left_motor.on(SpeedPercent(left_speed))
             right_motor.on(SpeedPercent(right_speed))
 
-            print(
-                f"steering={steering}, "
-                f"left={left_speed}, "
-                f"right={right_speed}"
-            )
-
         except (ValueError, UnicodeDecodeError) as error:
-            print(f"Invalid command {data!r}: {error}")
             left_motor.off(brake=True)
             right_motor.off(brake=True)
 
