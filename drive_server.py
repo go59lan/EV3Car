@@ -26,7 +26,10 @@ try:
             steering_str, speed_str = data.decode().strip().split(",")
 
             # Protect the motors from invalid controller values.
-            steering = max(-100, min(100, int(steering_str)))
+            # Steering can go up to +-130 (robot_controller2.py's
+            # clamp) - the tightest curve on the track needs more
+            # than +-100 to actually complete the turn.
+            steering = max(-130, min(130, int(steering_str)))
             speed = -max(0, min(100, int(speed_str)))
 
             # Move the physical steering motor without blocking drive updates.
@@ -37,10 +40,10 @@ try:
             )
 
             # At steering:
-            #   0   -> inner wheel = +speed
-            #   50  -> inner wheel = 0
-            #   100 -> inner wheel = -speed
-            turn_amount = abs(steering) / 100.0
+            #   0    -> inner wheel = speed (same as outer)
+            #   65   -> inner wheel = speed / 2
+            #   130  -> inner wheel = 0
+            turn_amount = abs(steering) / 130.0
             inner_speed = round(speed * (1.0 - turn_amount))
 
             if steering > 0:
