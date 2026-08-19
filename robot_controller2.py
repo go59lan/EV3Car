@@ -9,42 +9,37 @@ EV3_PORT = 5000
 
 
 class RobotController:
-    """Road follower for a gray road with yellow edges and a dashed white center."""
+    """Follow yellow road borders with connected bottom-up scanlines."""
 
     def __init__(self):
         self.cap = None
         self.latest_frame = None
         self.running = False
-
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        # P control is enough once the image measurement is stable.
+        # Steering control. The image measurement is smoothed and the command
+        # is rate-limited, so a single bad frame cannot produce full lock.
         self.Kp = 0.6
-
-        # Center smoothing and steering rate limiting prevent one bad frame
-        # from commanding a sudden full-lock turn.
-        self.cx_filtered = None
-        self.center_new_weight = 0.35
+        self.target_filtered = None
         self.last_correction = 0
         self.max_steering_step = 8
+        self.turn_steering_step = 14
 
         self.speed = 10
-        self.turn_speed = 7
+        self.turn_speed = 6
         self.recovery_speed = 5
         self.recovery_seconds = 0.35
         self.lost_since = None
+        self.missing_frames = 0
 
-        # Geometry learned while both yellow borders are visible.
-        self.lane_width = None
-        self.last_left_x = None
-        self.last_right_x = None
+        # Width is learned independently at the different scan heights. That
+        # matters because perspective makes the road narrower near the top.
+        self.width_profile = {}
+        self.near_lane_width = None
 
-        # White-line history is kept separately from the general road center.
-        # A yellow midpoint must not silently become a "previous white line".
-        self.last_white_x = None
-        self.white_missing_frames = 0
         self.last_trusted_center = None
-        self.center_missing_frames = 0
+        self.last_left_near_x = None
+        self.last_right_near_x = None
 
     def run(self):
         self.running = True
@@ -63,94 +58,75 @@ class RobotController:
                     continue
 
                 h, w = frame.shape[:2]
-                y_target = int(h * 0.65)
+                detection = self.detect_road(frame)
+                navigation = self.calculate_navigation(detection, w, h)
 
-                # Everything is recalculated on each frame. Never reuse an old
-                # cx as if it were a new camera measurement.
-                cx = None
-                source = "none"
-
-                left_line, right_line, yellow_mask = self.detect_road(frame)
-                yellow_center, yellow_mode = self.center_from_yellow(
-                    left_line, right_line, y_target, w
-                )
-
-                center_line, white_mask = self.detect_center_line(
-                    frame=frame,
-                    left_line=left_line,
-                    right_line=right_line,
-                    expected_center=yellow_center,
-                    y_target=y_target,
-                )
-                white_x = self.x_at_y(center_line, y_target)
-
-                if white_x is not None:
-                    self.last_white_x = white_x
-                    self.white_missing_frames = 0
-                else:
-                    self.white_missing_frames += 1
-                    if self.white_missing_frames > 20:
-                        self.last_white_x = None
-
-                # A white line is used only after detect_center_line has passed
-                # the yellow-corridor, continuity, and dashed-pattern checks.
-                if white_x is not None:
-                    cx = float(white_x)
-                    source = "white dash"
-                elif yellow_center is not None:
-                    cx = float(yellow_center)
-                    source = "yellow " + yellow_mode
-
-                if cx is not None:
+                if navigation is not None:
                     self.lost_since = None
-                    self.center_missing_frames = 0
-                    self.last_trusted_center = cx
+                    self.missing_frames = 0
 
-                    if self.cx_filtered is None:
-                        self.cx_filtered = cx
+                    target_x = navigation["target_x"]
+                    turn_strength = navigation["turn_strength"]
+
+                    # React faster when a connected horizontal yellow segment
+                    # proves that the border is turning out of the frame.
+                    new_weight = 0.65 if turn_strength > 0 else 0.35
+                    if self.target_filtered is None:
+                        self.target_filtered = target_x
                     else:
-                        a = self.center_new_weight
-                        self.cx_filtered = a * cx + (1.0 - a) * self.cx_filtered
+                        self.target_filtered = (
+                            new_weight * target_x
+                            + (1.0 - new_weight) * self.target_filtered
+                        )
 
-                    cx = self.cx_filtered
                     camera_center = w / 2.0
-                    error = camera_center - cx
-
+                    error = camera_center - self.target_filtered
                     desired = int(np.clip(self.Kp * error, -100, 100))
-                    correction = self.limit_steering_change(desired)
+
+                    maximum_step = (
+                        self.turn_steering_step
+                        if turn_strength > 0
+                        else self.max_steering_step
+                    )
+                    correction = self.limit_steering_change(
+                        desired, maximum_step
+                    )
 
                     speed = self.speed
-                    if abs(correction) >= 45 or yellow_mode != "both":
+                    if (
+                        turn_strength > 0
+                        or abs(correction) >= 45
+                        or navigation["mode"] != "both"
+                    ):
                         speed = self.turn_speed
 
+                    self.last_trusted_center = self.target_filtered
                     self.send_command(correction, speed)
-                    self.draw_tracking(
-                        frame, cx, y_target, error, correction, speed, source
+                    self.draw_status(
+                        frame,
+                        self.target_filtered,
+                        error,
+                        correction,
+                        speed,
+                        navigation,
                     )
                 else:
-                    self.center_missing_frames += 1
-                    if self.center_missing_frames > 20:
+                    self.missing_frames += 1
+                    if self.missing_frames > 20:
+                        self.target_filtered = None
                         self.last_trusted_center = None
-                        self.cx_filtered = None
                     self.recover_or_stop(frame)
+
+                self.draw_detection(frame, detection)
 
                 camera_center = w // 2
                 cv2.line(
                     frame,
                     (camera_center, h - 1),
-                    (camera_center, int(h * 0.52)),
+                    (camera_center, int(h * 0.44)),
                     (255, 0, 0),
                     2,
                 )
-
-                if left_line is not None:
-                    self.draw_line(frame, left_line, y_target, (0, 255, 0))
-                if right_line is not None:
-                    self.draw_line(frame, right_line, y_target, (0, 255, 0))
-                if center_line is not None:
-                    self.draw_line(frame, center_line, y_target, (255, 0, 255))
-
-                self.draw_mask_previews(frame, yellow_mask, white_mask)
 
                 success, jpeg = cv2.imencode(".jpg", frame)
                 if success:
@@ -159,20 +135,21 @@ class RobotController:
             self.stop()
 
     # ------------------------------------------------------------------
-    # Yellow road-border detection
+    # Yellow mask and connected scanline paths
     # ------------------------------------------------------------------
 
-    def detect_road(self, frame):
-        h, w = frame.shape[:2]
+    def make_yellow_mask(self, frame):
+        h, _ = frame.shape[:2]
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
+        # Tuned from the measured RGB yellow samples. Raising the minimum hue
+        # rejects the brown sample that was previously classified as yellow.
         yellow_mask = cv2.inRange(
             hsv,
-            np.array([14, 70, 65], dtype=np.uint8),
-            np.array([42, 255, 255], dtype=np.uint8),
+            np.array([28, 75, 135], dtype=np.uint8),
+            np.array([42, 180, 255], dtype=np.uint8),
         )
 
-        # A small kernel preserves thin yellow fragments at the frame edges.
         kernel = np.ones((3, 3), np.uint8)
         yellow_mask = cv2.morphologyEx(
             yellow_mask, cv2.MORPH_OPEN, kernel, iterations=1
@@ -181,408 +158,459 @@ class RobotController:
             yellow_mask, cv2.MORPH_CLOSE, kernel, iterations=2
         )
 
-        roi_top = int(h * 0.50)
-        roi = self.apply_roi(yellow_mask, roi_top)
+        # Look from 44% of the image height down to the bottom. Unlike Hough
+        # filtering, no orientation is rejected: vertical, curved, diagonal,
+        # and fully horizontal yellow markings all remain in this mask.
+        roi_top = int(h * 0.44)
+        yellow_mask[:roi_top, :] = 0
+        return yellow_mask, roi_top
 
-        lines = cv2.HoughLinesP(
-            roi,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=16,
-            minLineLength=14,
-            maxLineGap=35,
-        )
-
-        if lines is None:
-            return None, None, yellow_mask
-
-        y_reference = int(h * 0.70)
-        candidates = []
-
-        for detected in lines[:, 0]:
-            segment = self.normalize_segment(tuple(map(int, detected)))
-            x1, y1, x2, y2 = segment
-            dx = x2 - x1
-            dy = y2 - y1
-            length = float(np.hypot(dx, dy))
-
-            # This accepts vertical lines. The original `x2 == x1: continue`
-            # discarded exactly the lines seen on a straight road.
-            if length < 14 or abs(dy) < 8 or abs(dy) < 0.35 * abs(dx):
-                continue
-
-            x_reference = self.x_at_y(segment, y_reference)
-            if x_reference is None or not (-w <= x_reference <= 2 * w):
-                continue
-
-            candidates.append((x_reference, length, segment))
-
-        if not candidates:
-            return None, None, yellow_mask
-
-        # Merge repeated Hough segments from the same painted line, but keep
-        # nearby lines from different road sections as separate candidates.
-        clusters = self.cluster_segments(candidates, max(14, int(w * 0.04)))
-
-        # A different part of the road can also be visible in the camera,
-        # especially around a U-turn. Do not select the outermost yellow
-        # clusters. Split them at the image center and keep only the innermost
-        # cluster on each side:
-        #
-        #   left side  -> greatest X (closest to the middle)
-        #   right side -> smallest X (closest to the middle)
-        #
-        # If all clusters are on the same side, this deliberately returns only
-        # one line. For example, with two lines on the left, the line closer to
-        # the middle is kept and the real right border is treated as out of view.
-
-        left_cluster, right_cluster = self.select_center_side_clusters(
-            clusters, w
-        )
-
-        left_line = self.fit_cluster(left_cluster, roi_top, h - 1)
-        right_line = self.fit_cluster(right_cluster, roi_top, h - 1)
-
-        return left_line, right_line, yellow_mask
-
-    def center_from_yellow(self, left_line, right_line, y_target, image_width):
-        left_x = self.x_at_y(left_line, y_target)
-        right_x = self.x_at_y(right_line, y_target)
-
-        if left_x is not None and right_x is not None:
-            if right_x < left_x:
-                left_x, right_x = right_x, left_x
-
-            measured_width = right_x - left_x
-            if measured_width >= image_width * 0.20:
-                measured_width = float(
-                    np.clip(
-                        measured_width,
-                        image_width * 0.25,
-                        image_width * 1.60,
-                    )
-                )
-                if self.lane_width is None:
-                    self.lane_width = measured_width
-                else:
-                    self.lane_width = 0.85 * self.lane_width + 0.15 * measured_width
-
-                self.last_left_x = left_x
-                self.last_right_x = right_x
-                return (left_x + right_x) / 2.0, "both"
-
-        # If only one border is visible, infer the center from the road width
-        # learned on previous frames. Never invent the missing line at x=0/w.
-        if self.lane_width is not None:
-            if left_x is not None:
-                self.last_left_x = left_x
-                return left_x + self.lane_width / 2.0, "left only"
-            if right_x is not None:
-                self.last_right_x = right_x
-                return right_x - self.lane_width / 2.0, "right only"
-
-        return None, "lost"
-
-    # ------------------------------------------------------------------
-    # Dashed white center-line detection
-    # ------------------------------------------------------------------
-
-    def detect_center_line(
-        self,
-        frame,
-        left_line=None,
-        right_line=None,
-        expected_center=None,
-        y_target=None,
-    ):
+    def detect_road(self, frame):
         h, w = frame.shape[:2]
-        if y_target is None:
-            y_target = int(h * 0.65)
+        yellow_mask, roi_top = self.make_yellow_mask(frame)
 
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        white_mask = cv2.inRange(
-            hsv,
-            np.array([0, 0, 175], dtype=np.uint8),
-            np.array([179, 65, 255], dtype=np.uint8),
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            yellow_mask, connectivity=8
         )
 
-        kernel = np.ones((3, 3), np.uint8)
-        white_mask = cv2.morphologyEx(
-            white_mask, cv2.MORPH_OPEN, kernel, iterations=1
-        )
-        white_mask = cv2.morphologyEx(
-            white_mask, cv2.MORPH_CLOSE, kernel, iterations=1
-        )
+        minimum_area = max(18, int(w * h * 0.00007))
+        minimum_span = max(10, int(min(w, h) * 0.025))
+        valid_labels = []
 
-        roi_top = int(h * 0.50)
-        roi = self.apply_roi(white_mask, roi_top)
+        for label in range(1, count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            component_width = int(stats[label, cv2.CC_STAT_WIDTH])
+            component_height = int(stats[label, cv2.CC_STAT_HEIGHT])
 
-        # Keep dashes separate. A large maxLineGap can turn a dashed line and a
-        # solid mat border into similarly long Hough lines.
-        lines = cv2.HoughLinesP(
-            roi,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=12,
-            minLineLength=10,
-            maxLineGap=22,
+            # Accept a component if it is long in either direction. This is
+            # what allows a fully horizontal border at a sharp turn to survive.
+            if area >= minimum_area and max(
+                component_width, component_height
+            ) >= minimum_span:
+                valid_labels.append(label)
+
+        component_runs = self.extract_component_runs(
+            labels, stats, valid_labels
         )
 
-        if lines is None:
-            return None, white_mask
+        # A component must reach the lower 28% of the frame to seed a road
+        # border. Yellow from another road visible only in the distance is not
+        # allowed to start a path.
+        seed_zone_top = int(h * 0.72)
+        paths = []
 
-        reference = expected_center
-        if reference is None:
-            reference = self.last_trusted_center
-        if reference is None:
-            reference = self.last_white_x
-        if reference is None:
-            # Conservative first acquisition: a center dash should begin near
-            # the camera center. An outside mat border should not.
-            reference = w / 2.0
-            reference_limit = w * 0.20
-        else:
-            reference_limit = max(45.0, w * 0.15)
-
-        accepted = []
-
-        for detected in lines[:, 0]:
-            segment = self.normalize_segment(tuple(map(int, detected)))
-            x1, y1, x2, y2 = segment
-            dx = x2 - x1
-            dy = y2 - y1
-            length = float(np.hypot(dx, dy))
-
-            # Reject horizontal mat markings but retain vertical center dashes.
-            if length < 10 or abs(dy) < 7 or abs(dy) < 0.35 * abs(dx):
+        for label in valid_labels:
+            runs_by_y = component_runs.get(label)
+            if not runs_by_y:
                 continue
 
-            candidate_x = self.x_at_y(segment, y_target)
-            if candidate_x is None or not (0 <= candidate_x < w):
+            bottom_y = max(runs_by_y)
+            if bottom_y < seed_zone_top:
                 continue
 
-            reference_error = abs(candidate_x - reference)
-            if reference_error > reference_limit:
-                continue
+            path = self.trace_component(label, runs_by_y, w)
+            if path is not None:
+                paths.append(path)
 
-            # Hard temporal gate. The previous version picked the nearest line
-            # even when every candidate was far away, which let the map border
-            # hijack the detector in a single frame.
-            temporal_error = 0.0
-            if self.last_white_x is not None:
-                temporal_error = abs(candidate_x - self.last_white_x)
-                if temporal_error > max(55.0, w * 0.14):
+        left_path, right_path = self.select_current_borders(paths, w)
+
+        scan_step = max(8, int(h * 0.025))
+        scan_y_values = list(range(h - 6, roi_top - 1, -scan_step))
+        centers = self.build_center_samples(
+            left_path,
+            right_path,
+            scan_y_values,
+            w,
+        )
+
+        turn_direction, turn_strength = self.horizontal_turn_hint(
+            left_path, right_path, w
+        )
+
+        return {
+            "yellow_mask": yellow_mask,
+            "roi_top": roi_top,
+            "scan_y_values": scan_y_values,
+            "candidate_paths": paths,
+            "left_path": left_path,
+            "right_path": right_path,
+            "centers": centers,
+            "turn_direction": turn_direction,
+            "turn_strength": turn_strength,
+        }
+
+    @staticmethod
+    def extract_component_runs(labels, stats, valid_labels):
+        """Return every contiguous X-run for every component and image row."""
+        component_runs = {}
+
+        for label in valid_labels:
+            x0 = int(stats[label, cv2.CC_STAT_LEFT])
+            y0 = int(stats[label, cv2.CC_STAT_TOP])
+            width = int(stats[label, cv2.CC_STAT_WIDTH])
+            height = int(stats[label, cv2.CC_STAT_HEIGHT])
+            runs_by_y = {}
+
+            for y in range(y0, y0 + height):
+                xs = np.flatnonzero(labels[y, x0:x0 + width] == label)
+                if xs.size == 0:
                     continue
 
-            center_error = self.center_band_error(
-                segment, left_line, right_line, w
-            )
-            if center_error is None and left_line is not None and right_line is not None:
-                # Both yellow borders exist but this white candidate could not
-                # be proven to lie between them at matching Y-coordinates.
-                continue
-            if center_error is not None and center_error > 0.32:
-                # 0 means the exact yellow midpoint; 0.5 means a yellow edge.
-                # The dashed line must stay in the central part of the road.
-                continue
+                xs = xs + x0
+                split_after = np.flatnonzero(np.diff(xs) > 1)
+                starts = np.concatenate(([0], split_after + 1))
+                ends = np.concatenate((split_after, [xs.size - 1]))
 
-            occupancy, longest_run_ratio = self.line_pattern(
-                white_mask, segment, roi_top, h - 1
-            )
-            if occupancy > 0.80 and longest_run_ratio > 0.65:
-                # A solid white map border remains white for most of the ROI.
-                # A dashed center line necessarily contains visible gaps.
-                continue
+                runs_by_y[y] = [
+                    (int(xs[start]), int(xs[end]))
+                    for start, end in zip(starts, ends)
+                ]
 
-            geometry_penalty = 0.0 if center_error is None else center_error * w
-            solid_penalty = max(0.0, occupancy - 0.55) * 80.0
-            score = (
-                reference_error
-                + 0.35 * temporal_error
-                + geometry_penalty
-                + solid_penalty
-                - min(length, 80.0) * 0.05
-            )
-            accepted.append((score, candidate_x, length, segment))
+            component_runs[label] = runs_by_y
 
-        if not accepted:
-            return None, white_mask
+        return component_runs
 
-        accepted.sort(key=lambda item: item[0])
-        best_x = accepted[0][1]
-
-        # Combine only segments belonging to the winning dash trajectory.
-        matching = [
-            (item[1], item[2], item[3])
-            for item in accepted
-            if abs(item[1] - best_x) <= max(18, int(w * 0.045))
-        ]
-        center_line = self.fit_cluster(matching, roi_top, h - 1)
-
-        final_x = self.x_at_y(center_line, y_target)
-        if final_x is None or abs(final_x - reference) > reference_limit:
-            return None, white_mask
-
-        return center_line, white_mask
-
-    def center_band_error(self, candidate, left_line, right_line, image_width):
-        """Compare white and yellow geometry at identical image heights."""
-        if left_line is None or right_line is None:
+    def trace_component(self, label, runs_by_y, image_width):
+        """Trace one connected yellow component from its bottom toward the top."""
+        if not runs_by_y:
             return None
 
-        _, y1, _, y2 = candidate
-        sample_y_values = (y1, (y1 + y2) // 2, y2)
-        normalized_errors = []
+        y_values = sorted(runs_by_y, reverse=True)
+        bottom_y = y_values[0]
 
-        for y in sample_y_values:
-            white_x = self.x_at_y(candidate, y)
-            left_x = self.x_at_y(left_line, y)
-            right_x = self.x_at_y(right_line, y)
-            if white_x is None or left_x is None or right_x is None:
-                continue
-
-            road_min = min(left_x, right_x)
-            road_max = max(left_x, right_x)
-            road_width = road_max - road_min
-            if road_width < image_width * 0.15:
-                continue
-
-            road_center = (road_min + road_max) / 2.0
-            normalized_errors.append(abs(white_x - road_center) / road_width)
-
-        if not normalized_errors:
-            return None
-        return float(np.mean(normalized_errors))
-
-    def line_pattern(self, mask, line, y_start, y_end):
-        """Measure whether a proposed white line is dashed or continuous."""
-        h, w = mask.shape[:2]
-        samples = []
-
-        for y in range(max(0, y_start), min(h - 1, y_end) + 1, 2):
-            x = self.x_at_y(line, y)
-            if x is None or x < 0 or x >= w:
-                continue
-            x1 = max(0, x - 3)
-            x2 = min(w, x + 4)
-            samples.append(bool(np.any(mask[y, x1:x2] > 0)))
-
-        if not samples:
-            return 0.0, 0.0
-
-        occupied = sum(samples)
-        longest_run = 0
-        current_run = 0
-        for is_white in samples:
-            if is_white:
-                current_run += 1
-                longest_run = max(longest_run, current_run)
-            else:
-                current_run = 0
-
-        return occupied / len(samples), longest_run / len(samples)
-
-    # ------------------------------------------------------------------
-    # Shared image geometry
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def apply_roi(mask, roi_top):
-        roi_mask = np.zeros_like(mask)
-        roi_mask[roi_top:, :] = 255
-        return cv2.bitwise_and(mask, roi_mask)
-
-    @staticmethod
-    def normalize_segment(line):
-        x1, y1, x2, y2 = line
-        if y1 <= y2:
-            return x1, y1, x2, y2
-        return x2, y2, x1, y1
-
-    @staticmethod
-    def cluster_x(cluster):
-        total_weight = sum(item[1] for item in cluster)
-        return sum(item[0] * item[1] for item in cluster) / total_weight
-
-    @staticmethod
-    def cluster_segments(candidates, gap):
-        candidates = sorted(candidates, key=lambda item: item[0])
-        clusters = []
-        for candidate in candidates:
-            if not clusters or candidate[0] - clusters[-1][-1][0] > gap:
-                clusters.append([candidate])
-            else:
-                clusters[-1].append(candidate)
-        return clusters
-
-    def select_center_side_clusters(self, clusters, image_width):
-        """Keep at most one yellow cluster on each side of image center."""
-        image_center = image_width / 2.0
-
-        left_clusters = [
-            cluster
-            for cluster in clusters
-            if self.cluster_x(cluster) < image_center
-        ]
-        right_clusters = [
-            cluster
-            for cluster in clusters
-            if self.cluster_x(cluster) >= image_center
-        ]
-
-        # On the left, a larger X is closer to the middle. On the right, a
-        # smaller X is closer to the middle.
-        left_cluster = (
-            max(left_clusters, key=self.cluster_x)
-            if left_clusters
-            else None
+        # At the first row choose the run nearest the image center. Branches
+        # farther from the current road are ignored.
+        seed_run = min(
+            runs_by_y[bottom_y],
+            key=lambda run: abs(self.run_center(run) - image_width / 2.0),
         )
-        right_cluster = (
-            min(right_clusters, key=self.cluster_x)
-            if right_clusters
-            else None
-        )
+        anchor_x = self.run_center(seed_run)
 
-        return left_cluster, right_cluster
-
-    @staticmethod
-    def fit_cluster(cluster, y_top, y_bottom):
-        if not cluster:
-            return None
-
+        horizontal_minimum = max(45, int(image_width * 0.10))
+        active_horizontal_direction = 0
         points = []
-        for _, _, (x1, y1, x2, y2) in cluster:
-            points.extend(((x1, y1), (x2, y2)))
+        points_by_y = {}
+        horizontal_segments = []
 
-        points = np.asarray(points, dtype=np.float32)
-        fit = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
-        vx, vy, x0, y0 = [float(value) for value in fit]
+        for y in y_values:
+            row_runs = runs_by_y[y]
+            run = min(
+                row_runs,
+                key=lambda candidate: self.distance_to_run(anchor_x, candidate),
+            )
 
-        if abs(vy) < 1e-6:
-            return None
+            x1, x2 = run
+            run_width = x2 - x1 + 1
 
-        x_top = x0 + (y_top - y0) * vx / vy
-        x_bottom = x0 + (y_bottom - y0) * vx / vy
-        return int(x_top), int(y_top), int(x_bottom), int(y_bottom)
+            if run_width >= horizontal_minimum:
+                if active_horizontal_direction == 0:
+                    distance_left = abs(anchor_x - x1)
+                    distance_right = abs(x2 - anchor_x)
+
+                    # If the path entered near one endpoint, the far endpoint
+                    # shows the direction of the turn. If it entered near the
+                    # exact middle, the direction is ambiguous and no hint is
+                    # generated from that row.
+                    difference = abs(distance_right - distance_left)
+                    if difference >= horizontal_minimum * 0.20:
+                        active_horizontal_direction = (
+                            1 if distance_right > distance_left else -1
+                        )
+
+                if active_horizontal_direction > 0:
+                    chosen_x = float(x2)
+                elif active_horizontal_direction < 0:
+                    chosen_x = float(x1)
+                else:
+                    chosen_x = float(np.clip(anchor_x, x1, x2))
+
+                # Store even an ambiguous standalone horizontal line. After the
+                # path is assigned to the left or right border, its position in
+                # the previous frame can resolve which endpoint it entered.
+                horizontal_segments.append(
+                    {
+                        "x1": x1,
+                        "x2": x2,
+                        "y": y,
+                        "length": run_width,
+                        "direction": active_horizontal_direction,
+                    }
+                )
+            else:
+                chosen_x = self.run_center(run)
+                active_horizontal_direction = 0
+
+            points.append((chosen_x, y))
+            points_by_y[y] = chosen_x
+            anchor_x = chosen_x
+
+        # Median over the bottom 12 rows is more stable than one edge pixel.
+        near_points = [x for x, y in points if y >= bottom_y - 12]
+        near_x = float(np.median(near_points))
+
+        return {
+            "label": label,
+            "bottom_y": bottom_y,
+            "near_x": near_x,
+            "points": points,
+            "points_by_y": points_by_y,
+            "horizontal_segments": horizontal_segments,
+        }
 
     @staticmethod
-    def x_at_y(line, y):
-        if line is None:
-            return None
+    def run_center(run):
+        return (run[0] + run[1]) / 2.0
 
-        x1, y1, x2, y2 = line
-        if y2 == y1:
-            return None
+    @staticmethod
+    def distance_to_run(x, run):
+        if run[0] <= x <= run[1]:
+            return 0.0
+        return min(abs(x - run[0]), abs(x - run[1]))
 
-        return int(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+    def select_current_borders(self, paths, image_width):
+        """Keep the bottom-connected path nearest center on each side."""
+        image_center = image_width / 2.0
+        previous_left_x = self.last_left_near_x
+        previous_right_x = self.last_right_near_x
+        left_candidates = [
+            path for path in paths if path["near_x"] < image_center
+        ]
+        right_candidates = [
+            path for path in paths if path["near_x"] >= image_center
+        ]
+
+        left_path = (
+            max(left_candidates, key=lambda path: path["near_x"])
+            if left_candidates
+            else None
+        )
+        right_path = (
+            min(right_candidates, key=lambda path: path["near_x"])
+            if right_candidates
+            else None
+        )
+
+        self.resolve_ambiguous_horizontal(left_path, previous_left_x)
+        self.resolve_ambiguous_horizontal(right_path, previous_right_x)
+
+        if left_path is not None:
+            self.last_left_near_x = left_path["near_x"]
+        if right_path is not None:
+            self.last_right_near_x = right_path["near_x"]
+
+        return left_path, right_path
+
+    @staticmethod
+    def resolve_ambiguous_horizontal(path, previous_x):
+        """Use the preceding frame to orient a standalone horizontal border."""
+        if path is None or previous_x is None:
+            return
+
+        for segment in path["horizontal_segments"]:
+            if segment["direction"] != 0:
+                continue
+
+            distance_left = abs(previous_x - segment["x1"])
+            distance_right = abs(segment["x2"] - previous_x)
+            difference = abs(distance_right - distance_left)
+
+            if difference >= segment["length"] * 0.20:
+                segment["direction"] = (
+                    1 if distance_right > distance_left else -1
+                )
 
     # ------------------------------------------------------------------
-    # Driving and debug display
+    # Center path and turn calculation
     # ------------------------------------------------------------------
 
-    def limit_steering_change(self, desired):
-        low = self.last_correction - self.max_steering_step
-        high = self.last_correction + self.max_steering_step
+    def build_center_samples(
+        self,
+        left_path,
+        right_path,
+        scan_y_values,
+        image_width,
+    ):
+        centers = []
+        search_radius = max(4, int(len(scan_y_values) * 0.15))
+
+        for level, y in enumerate(scan_y_values):
+            left_x = self.path_x_at_y(left_path, y, search_radius)
+            right_x = self.path_x_at_y(right_path, y, search_radius)
+            center_x = None
+            mode = "lost"
+
+            if left_x is not None and right_x is not None:
+                measured_width = right_x - left_x
+
+                if measured_width >= image_width * 0.10:
+                    old_width = self.width_profile.get(level)
+                    if old_width is None:
+                        learned_width = measured_width
+                    else:
+                        learned_width = 0.85 * old_width + 0.15 * measured_width
+                    self.width_profile[level] = learned_width
+
+                    if level <= 3:
+                        if self.near_lane_width is None:
+                            self.near_lane_width = measured_width
+                        else:
+                            self.near_lane_width = (
+                                0.85 * self.near_lane_width
+                                + 0.15 * measured_width
+                            )
+
+                    center_x = (left_x + right_x) / 2.0
+                    mode = "both"
+
+            if center_x is None:
+                expected_width = self.width_for_level(level)
+
+                if expected_width is not None and left_x is not None:
+                    center_x = left_x + expected_width / 2.0
+                    mode = "left only"
+                elif expected_width is not None and right_x is not None:
+                    center_x = right_x - expected_width / 2.0
+                    mode = "right only"
+
+            if center_x is not None:
+                centers.append(
+                    {
+                        "x": float(center_x),
+                        "y": y,
+                        "level": level,
+                        "mode": mode,
+                    }
+                )
+
+        return centers
+
+    def width_for_level(self, level):
+        if level in self.width_profile:
+            return self.width_profile[level]
+
+        if self.width_profile:
+            nearest_level = min(
+                self.width_profile,
+                key=lambda known: abs(known - level),
+            )
+            return self.width_profile[nearest_level]
+
+        return self.near_lane_width
+
+    @staticmethod
+    def path_x_at_y(path, target_y, radius):
+        if path is None:
+            return None
+
+        points_by_y = path["points_by_y"]
+        if target_y in points_by_y:
+            return points_by_y[target_y]
+
+        nearest_y = None
+        nearest_distance = radius + 1
+        for y in points_by_y:
+            distance = abs(y - target_y)
+            if distance < nearest_distance:
+                nearest_y = y
+                nearest_distance = distance
+
+        if nearest_y is None or nearest_distance > radius:
+            return None
+        return points_by_y[nearest_y]
+
+    @staticmethod
+    def horizontal_turn_hint(left_path, right_path, image_width):
+        strongest_segments = []
+
+        for path in (left_path, right_path):
+            if path is None:
+                continue
+            directed_segments = [
+                segment
+                for segment in path["horizontal_segments"]
+                if segment["direction"] != 0
+            ]
+            if not directed_segments:
+                continue
+            strongest_segments.append(
+                max(
+                    directed_segments,
+                    key=lambda segment: segment["length"],
+                )
+            )
+
+        if not strongest_segments:
+            return 0, 0.0
+
+        vote = sum(
+            segment["direction"] * segment["length"]
+            for segment in strongest_segments
+        )
+
+        # Opposing equally strong components are ambiguous, so do not force a
+        # turn. Agreement or one clear connected segment creates a turn hint.
+        if abs(vote) < image_width * 0.05:
+            return 0, 0.0
+
+        direction = 1 if vote > 0 else -1
+        strength = min(1.0, abs(vote) / (image_width * 0.30))
+        return direction, strength
+
+    def calculate_navigation(self, detection, image_width, image_height):
+        centers = detection["centers"]
+        turn_direction = detection["turn_direction"]
+        turn_strength = detection["turn_strength"]
+
+        if centers:
+            # scan_y_values run from bottom to top, so the first center is the
+            # car's current position and the last is the farthest connected
+            # look-ahead point.
+            near = centers[0]
+            far = centers[-1]
+            target_x = near["x"] + 0.75 * (far["x"] - near["x"])
+            mode = far["mode"]
+        elif turn_direction != 0 and self.last_trusted_center is not None:
+            # A horizontal border can remain visible for a moment after the
+            # opposite border disappears. Continue from the last safe center.
+            near = {
+                "x": self.last_trusted_center,
+                "y": int(image_height * 0.75),
+            }
+            far = near
+            target_x = self.last_trusted_center
+            mode = "horizontal only"
+        else:
+            return None
+
+        if turn_direction != 0:
+            target_x += (
+                turn_direction
+                * image_width
+                * 0.20
+                * turn_strength
+            )
+
+        target_x = float(np.clip(target_x, 0, image_width - 1))
+
+        return {
+            "target_x": target_x,
+            "near": near,
+            "far": far,
+            "mode": mode,
+            "turn_direction": turn_direction,
+            "turn_strength": turn_strength,
+        }
+
+    # ------------------------------------------------------------------
+    # Driving and debug view
+    # ------------------------------------------------------------------
+
+    def limit_steering_change(self, desired, maximum_step=None):
+        if maximum_step is None:
+            maximum_step = self.max_steering_step
+
+        low = self.last_correction - maximum_step
+        high = self.last_correction + maximum_step
         correction = int(np.clip(desired, low, high))
         correction = int(np.clip(correction, -100, 100))
         self.last_correction = correction
@@ -595,19 +623,23 @@ class RobotController:
 
         elapsed = now - self.lost_since
         if elapsed <= self.recovery_seconds and self.last_correction != 0:
-            # Preserve the turn briefly instead of steering straight at the
-            # exact moment the curve moves out of the narrow camera view.
             self.send_command(self.last_correction, self.recovery_speed)
-            text = "RECOVERING ROAD"
+            message = "RECOVERING ROAD"
             color = (0, 165, 255)
         else:
             self.send_command(0, 0)
             self.last_correction = 0
-            text = "ROAD LOST - STOPPED"
+            message = "ROAD LOST - STOPPED"
             color = (0, 0, 255)
 
         cv2.putText(
-            frame, text, (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2
+            frame,
+            message,
+            (10, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            color,
+            2,
         )
 
     def send_command(self, correction, speed):
@@ -620,63 +652,95 @@ class RobotController:
         )
 
     @staticmethod
-    def draw_tracking(frame, cx, y_target, error, correction, speed, source):
-        h, w = frame.shape[:2]
-        draw_x = int(np.clip(cx, 0, w - 1))
-        cv2.circle(frame, (draw_x, y_target), 9, (255, 0, 0), -1)
-
+    def draw_status(
+        frame,
+        target_x,
+        error,
+        correction,
+        speed,
+        navigation,
+    ):
+        direction_names = {-1: "LEFT", 0: "NONE", 1: "RIGHT"}
         labels = (
-            "Road center: {:.0f}".format(cx),
+            "Target: {:.0f}".format(target_x),
             "Error: {:.0f}".format(error),
             "Correction: {}  Speed: {}".format(correction, speed),
-            "Source: {}".format(source),
+            "Borders: {}".format(navigation["mode"]),
+            "Horizontal turn: {} {:.2f}".format(
+                direction_names[navigation["turn_direction"]],
+                navigation["turn_strength"],
+            ),
         )
+
         for index, label in enumerate(labels):
             cv2.putText(
                 frame,
                 label,
-                (10, 28 + index * 27),
+                (10, 27 + index * 25),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
+                0.58,
                 (0, 255, 255),
                 2,
             )
 
-    def draw_line(self, frame, line, y_target, color):
-        if line is None:
-            return
-
+    def draw_detection(self, frame, detection):
         h, w = frame.shape[:2]
-        x1, y1, _, _ = line
-        x_target = self.x_at_y(line, y_target)
-        if x_target is None:
-            return
 
-        cv2.line(
-            frame,
-            (int(np.clip(x1, 0, w - 1)), int(np.clip(y1, 0, h - 1))),
-            (int(np.clip(x_target, 0, w - 1)), y_target),
-            color,
-            3,
-        )
+        # Draw every second scanline to show the rows used for path sampling.
+        for index, y in enumerate(detection["scan_y_values"]):
+            if index % 2 == 0:
+                cv2.line(frame, (0, y), (w - 1, y), (70, 70, 70), 1)
 
-    @staticmethod
-    def draw_mask_previews(frame, yellow_mask, white_mask):
-        h, w = frame.shape[:2]
+        self.draw_path(frame, detection["left_path"], (0, 255, 0))
+        self.draw_path(frame, detection["right_path"], (0, 200, 255))
+
+        center_points = [
+            (int(center["x"]), int(center["y"]))
+            for center in detection["centers"]
+            if 0 <= center["x"] < w
+        ]
+        if len(center_points) >= 2:
+            points = np.asarray(center_points, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(frame, [points], False, (255, 0, 0), 3)
+        for point in center_points:
+            cv2.circle(frame, point, 4, (255, 0, 0), -1)
+
+        # Mask preview in the upper-right corner.
         preview_w = max(1, w // 5)
         preview_h = max(1, h // 5)
+        preview = cv2.resize(
+            detection["yellow_mask"], (preview_w, preview_h)
+        )
+        preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
+        preview[:, :, 0] = 0
+        frame[0:preview_h, w - preview_w:w] = preview
 
-        yellow = cv2.resize(yellow_mask, (preview_w, preview_h))
-        yellow = cv2.cvtColor(yellow, cv2.COLOR_GRAY2BGR)
-        yellow[:, :, 0] = 0
+    @staticmethod
+    def draw_path(frame, path, color):
+        if path is None:
+            return
 
-        white = cv2.resize(white_mask, (preview_w, preview_h))
-        white = cv2.cvtColor(white, cv2.COLOR_GRAY2BGR)
+        h, w = frame.shape[:2]
+        # One point every four rows is enough for a smooth debug curve.
+        visible = [
+            (int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1)))
+            for index, (x, y) in enumerate(path["points"])
+            if index % 4 == 0
+        ]
 
-        x1 = w - preview_w
-        frame[0:preview_h, x1:w] = yellow
-        if 2 * preview_h <= h:
-            frame[preview_h:2 * preview_h, x1:w] = white
+        if len(visible) >= 2:
+            points = np.asarray(visible, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(frame, [points], False, color, 3)
+
+        # Horizontal evidence is orange so it is easy to verify in the stream.
+        for segment in path["horizontal_segments"]:
+            cv2.line(
+                frame,
+                (segment["x1"], segment["y"]),
+                (segment["x2"], segment["y"]),
+                (0, 140, 255),
+                2,
+            )
 
     def stop(self):
         self.running = False
